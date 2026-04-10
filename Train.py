@@ -61,11 +61,26 @@ lr_scheduler = lr_sched.MultiStepLR(optimizer, milestones=LR_MILESTONES, gamma=L
 
 env = Env(problem_size=PROBLEM_SIZE, pomo_size=POMO_SIZE)
 
+# ── 断点续训 ──────────────────────────────────────────────────────────────────
+start_epoch = 1
+if RESUME:
+    assert os.path.isdir(RESUME_CKPT_PATH), f"Checkpoint 目录不存在: {RESUME_CKPT_PATH}"
+    model.load_state_dict(torch.load(os.path.join(RESUME_CKPT_PATH, 'MODEL_state_dic.pt'),
+                                     map_location=device))
+    optimizer.load_state_dict(torch.load(os.path.join(RESUME_CKPT_PATH, 'OPTIM_state_dic.pt'),
+                                         map_location=device))
+    lr_scheduler.load_state_dict(torch.load(os.path.join(RESUME_CKPT_PATH, 'LRSTEP_state_dic.pt'),
+                                             map_location=device))
+    # 从目录名解析 epoch：CheckPoint_ep00050 → 50
+    ckpt_dir_name = os.path.basename(RESUME_CKPT_PATH.rstrip('/\\'))
+    start_epoch = int(ckpt_dir_name.split('ep')[-1]) + 1
+    logger.info('Resumed from {} (start_epoch={})'.format(RESUME_CKPT_PATH, start_epoch))
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 timer_start       = time.time()
 checkpoint_epochs = set(np.arange(1, TOTAL_EPOCH + 1, MODEL_SAVE_INTERVAL).tolist())
 
-for epoch in range(1, TOTAL_EPOCH + 1):
+for epoch in range(start_epoch, TOTAL_EPOCH + 1):
 
     TRAIN(model, env, optimizer, lr_scheduler,
           epoch=epoch, timer_start=timer_start, logger=logger)
@@ -77,6 +92,7 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         os.makedirs(ckpt_path, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(ckpt_path, 'MODEL_state_dic.pt'))
         torch.save(optimizer.state_dict(), os.path.join(ckpt_path, 'OPTIM_state_dic.pt'))
+        torch.save(lr_scheduler.state_dict(), os.path.join(ckpt_path, 'LRSTEP_state_dic.pt'))
 
 torch.save(model.state_dict(), os.path.join(result_folder_path, 'MODEL_FINAL.pt'))
 logger.info('Training complete.')
