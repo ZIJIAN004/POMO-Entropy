@@ -14,13 +14,14 @@ _parser.add_argument('--problem', type=str, default=None)
 _parser.add_argument('--size', type=int, default=None)
 _args, _ = _parser.parse_known_args()
 
-from HYPER_PARAMS import *
-
+import HYPER_PARAMS as _HP
 if _args.problem is not None:
-    PROBLEM_TYPE = _args.problem
+    _HP.PROBLEM_TYPE = _args.problem
 if _args.size is not None:
-    PROBLEM_SIZE = _args.size
-    POMO_SIZE    = _args.size
+    _HP.PROBLEM_SIZE = _args.size
+    _HP.POMO_SIZE    = _args.size
+
+from HYPER_PARAMS import *
 
 if USE_ENTROPY_WEIGHT:
     SAVE_FOLDER_NAME = "POMO_{}_n{}-Entropy_g{}".format(
