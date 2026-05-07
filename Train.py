@@ -1,14 +1,26 @@
 """
-POMO Baseline — 纯 POMO REINFORCE 训练
-
-支持 TSP / CVRP / VRPTW，通过 HYPER_PARAMS.PROBLEM_TYPE 选择。
-数据生成逻辑与 UniCOP-Reason 一致。
+POMO — REINFORCE with optional entropy-weighted advantage modulation
 
 Run:
-    python Train.py
+    python Train.py                          # use HYPER_PARAMS defaults
+    python Train.py --problem tsp            # override problem type
+    python Train.py --problem cvrp --size 50 # override problem type and size
 """
 
+import argparse
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument('--problem', type=str, default=None)
+_parser.add_argument('--size', type=int, default=None)
+_args, _ = _parser.parse_known_args()
+
 from HYPER_PARAMS import *
+
+if _args.problem is not None:
+    PROBLEM_TYPE = _args.problem
+if _args.size is not None:
+    PROBLEM_SIZE = _args.size
+    POMO_SIZE    = _args.size
 
 if USE_ENTROPY_WEIGHT:
     SAVE_FOLDER_NAME = "POMO_{}_n{}-Entropy_g{}".format(
