@@ -13,34 +13,41 @@ def compute_entropy_weights(entropy, n_feasible, advantage, gamma):
     Returns:
         weights: (batch, pomo, num_steps), sum along dim=2 == num_steps
     """
-    H = entropy.reshape(-1)
-    log_F = torch.log(n_feasible.float().reshape(-1).clamp(min=1))
+    B, P, T = entropy.shape
 
-    log_F_mean = log_F.mean()
-    H_mean = H.mean()
+    H     = entropy.reshape(B, -1)
+    log_F = torch.log(n_feasible.float().reshape(B, -1).clamp(min=1))
+
+    log_F_mean     = log_F.mean(dim=1, keepdim=True)
+    H_mean         = H.mean(dim=1, keepdim=True)
     log_F_centered = log_F - log_F_mean
-    denom = log_F_centered.square().sum().clamp(min=1e-8)
-    a = (H * log_F_centered).sum() / denom
+    denom          = log_F_centered.square().sum(dim=1, keepdim=True).clamp(min=1e-8)
+    a = (H * log_F_centered).sum(dim=1, keepdim=True) / denom
     b = H_mean - a * log_F_mean
 
     residual = H - (a * log_F + b)
-    nf_flat  = n_feasible.reshape(-1).long()
 
-    max_nf   = nf_flat.max() + 1
-    ones     = torch.ones_like(H)
-    counts   = torch.zeros(max_nf, device=H.device).scatter_add_(0, nf_flat, ones)
-    sums     = torch.zeros(max_nf, device=H.device).scatter_add_(0, nf_flat, residual)
-    grp_mean = (sums / counts.clamp(min=1))[nf_flat]
+    nf      = n_feasible.reshape(B, -1).long()
+    max_nf  = nf.max() + 1
+    bid     = torch.arange(B, device=entropy.device)[:, None].expand_as(nf)
+    gid     = (bid * max_nf + nf).reshape(-1)
+    n_grp   = B * max_nf
 
-    centered = residual - grp_mean
-    sq_sums  = torch.zeros(max_nf, device=H.device).scatter_add_(0, nf_flat, centered.square())
-    grp_std  = ((sq_sums / counts.clamp(min=1)).sqrt().clamp(min=1e-8))[nf_flat]
+    res_flat = residual.reshape(-1)
+    ones     = torch.ones_like(res_flat)
 
-    delta_H  = (centered / grp_std).reshape_as(entropy)
+    counts   = torch.zeros(n_grp, device=entropy.device).scatter_add_(0, gid, ones)
+    sums     = torch.zeros(n_grp, device=entropy.device).scatter_add_(0, gid, res_flat)
+    grp_mean = (sums / counts.clamp(min=1))[gid]
+
+    centered = res_flat - grp_mean
+    sq_sums  = torch.zeros(n_grp, device=entropy.device).scatter_add_(0, gid, centered.square())
+    grp_std  = ((sq_sums / counts.clamp(min=1)).sqrt().clamp(min=1e-8))[gid]
+
+    delta_H = (centered / grp_std).reshape(B, P, T)
 
     sign_A = advantage.sign().unsqueeze(2)
     logit  = gamma * sign_A * delta_H
-    T      = entropy.size(2)
     w      = torch.softmax(logit, dim=2) * T
 
     return w
