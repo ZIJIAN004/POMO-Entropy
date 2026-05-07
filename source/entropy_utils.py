@@ -1,6 +1,7 @@
 import torch
 
 
+@torch.no_grad()
 def compute_entropy_weights(entropy, n_feasible, advantage, gamma):
     """
     Args:

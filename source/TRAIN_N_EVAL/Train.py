@@ -56,7 +56,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         if USE_ENTROPY_WEIGHT:
             weights  = compute_entropy_weights(
                 entropy_list, n_feasible_list, advantage,
-                ENTROPY_GAMMA).detach()
+                ENTROPY_GAMMA)
             log_prob = (prob_list.log() * weights).sum(dim=2)
         else:
             log_prob = prob_list.log().sum(dim=2)
