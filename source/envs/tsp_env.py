@@ -17,6 +17,7 @@ class Step_State:
     selected_count: int          = None
     current_node:   torch.Tensor = None
     ninf_mask:      torch.Tensor = None
+    n_feasible:     torch.Tensor = None
 
 
 class TSPEnv:
@@ -68,6 +69,7 @@ class TSPEnv:
         self.step_state.selected_count = self.selected_count
         self.step_state.current_node   = self.current_node
         self.step_state.ninf_mask      = self.ninf_mask
+        self.step_state.n_feasible     = (self.ninf_mask == 0).sum(dim=2)
 
     def _get_travel_distance(self):
         idx = self.selected_node_list[:, :, :, None].expand(-1, -1, -1, 2)

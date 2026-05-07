@@ -39,6 +39,12 @@ LR_MILESTONES  = [381, 391]
 LR_GAMMA       = 0.1
 
 # ===========================================================================
+# Entropy-Weighted Advantage Modulation
+# ===========================================================================
+USE_ENTROPY_WEIGHT   = True        # False = original POMO baseline
+ENTROPY_GAMMA        = 0.1         # softmax temperature (larger = sharper)
+
+# ===========================================================================
 # Checkpoint & Resume
 # ===========================================================================
 RESUME                = False     # 是否从 checkpoint 断点续训

@@ -48,6 +48,7 @@ class TSPModel(nn.Module):
             # POMO 分叉：每个 pomo 从不同节点出发
             selected = torch.arange(pomo_size, device=dev)[None, :].expand(batch_size, -1)
             prob = torch.ones(batch_size, pomo_size, device=dev)
+            entropy = torch.zeros(batch_size, pomo_size, device=dev)
             self.first_node = selected
         else:
             enc_first = get_encoding(self.encoded_nodes, self.first_node)
@@ -61,6 +62,8 @@ class TSPModel(nn.Module):
             score  = self.logit_clipping * torch.tanh(score) + state.ninf_mask
             probs  = F.softmax(score, dim=2)
 
+            entropy = -(probs * probs.clamp(min=1e-20).log()).sum(dim=2)
+
             if self.training:
                 while True:
                     with torch.no_grad():
@@ -73,4 +76,4 @@ class TSPModel(nn.Module):
                 selected = probs.argmax(dim=2)
                 prob = None
 
-        return selected, prob
+        return selected, prob, entropy

@@ -27,7 +27,7 @@ def EVAL(model, env, epoch, timer_start, logger, result_folder_path):
 
             state, reward, done = env.pre_step()
             while not done:
-                selected, _ = model(state)
+                selected, *_ = model(state)
                 state, reward, done = env.step(selected)
 
             max_reward, _ = reward.max(dim=1)

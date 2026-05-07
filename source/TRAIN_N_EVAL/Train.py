@@ -1,8 +1,8 @@
 """
-Train.py — 纯 POMO REINFORCE
+Train.py — POMO REINFORCE with optional entropy-weighted advantage modulation
 
 advantage_i = r_i - mean_j(r_j)
-loss = -mean(advantage * log_prob)
+loss = -mean(advantage * weighted_log_prob)
 """
 
 import time
@@ -10,6 +10,9 @@ import torch
 
 from HYPER_PARAMS import *
 from source.utilities import Average_Meter
+
+if USE_ENTROPY_WEIGHT:
+    from source.entropy_utils import compute_entropy_weights
 
 
 def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
@@ -32,17 +35,31 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         model.pre_forward(reset_state)
 
         prob_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+        if USE_ENTROPY_WEIGHT:
+            entropy_list    = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+            n_feasible_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+
         state, reward, done = env.pre_step()
 
         while not done:
-            selected, prob = model(state)
+            selected, prob, entropy = model(state)
+            if USE_ENTROPY_WEIGHT:
+                entropy_list    = torch.cat((entropy_list, entropy[:, :, None]), dim=2)
+                n_feasible_list = torch.cat((n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
             state, reward, done = env.step(selected)
             prob_list = torch.cat((prob_list, prob[:, :, None]), dim=2)
 
         # ── REINFORCE ────────────────────────────────────────────────────
         reward_f  = reward.float()
         advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
-        log_prob  = prob_list.log().sum(dim=2)
+
+        if USE_ENTROPY_WEIGHT:
+            weights  = compute_entropy_weights(
+                entropy_list, n_feasible_list, advantage,
+                ENTROPY_GAMMA).detach()
+            log_prob = (prob_list.log() * weights).sum(dim=2)
+        else:
+            log_prob = prob_list.log().sum(dim=2)
 
         loss = -(advantage * log_prob).mean()
 

@@ -21,6 +21,7 @@ class Step_State:
     current_node:   torch.Tensor = None
     ninf_mask:      torch.Tensor = None
     finished:       torch.Tensor = None
+    n_feasible:     torch.Tensor = None
 
 
 class CVRPEnv:
@@ -105,6 +106,7 @@ class CVRPEnv:
         self.step_state.current_node   = self.current_node
         self.step_state.ninf_mask      = self.ninf_mask
         self.step_state.finished       = self.finished
+        self.step_state.n_feasible     = (self.ninf_mask == 0).sum(dim=2)
 
     def _get_travel_distance(self):
         idx = self.selected_node_list[:, :, :, None].expand(-1, -1, -1, 2)

@@ -50,10 +50,12 @@ class CVRPModel(nn.Module):
         if state.selected_count == 0:
             selected = torch.zeros(batch_size, pomo_size, dtype=torch.long, device=dev)
             prob     = torch.ones(batch_size, pomo_size, device=dev)
+            entropy  = torch.zeros(batch_size, pomo_size, device=dev)
 
         elif state.selected_count == 1:
             selected = torch.arange(1, pomo_size + 1, device=dev)[None, :].expand(batch_size, -1)
             prob     = torch.ones(batch_size, pomo_size, device=dev)
+            entropy  = torch.zeros(batch_size, pomo_size, device=dev)
 
         else:
             enc_last = get_encoding(self.encoded_nodes, state.current_node)
@@ -63,6 +65,8 @@ class CVRPModel(nn.Module):
             score    = torch.matmul(mh_out, self.single_head_key) / self.sqrt_embedding_dim
             score    = self.logit_clipping * torch.tanh(score) + state.ninf_mask
             probs    = F.softmax(score, dim=2)
+
+            entropy  = -(probs * probs.clamp(min=1e-20).log()).sum(dim=2)
 
             if self.training:
                 while True:
@@ -76,4 +80,4 @@ class CVRPModel(nn.Module):
                 selected = probs.argmax(dim=2)
                 prob     = None
 
-        return selected, prob
+        return selected, prob, entropy

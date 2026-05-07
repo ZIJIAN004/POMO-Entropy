@@ -10,7 +10,11 @@ Run:
 
 from HYPER_PARAMS import *
 
-SAVE_FOLDER_NAME = "POMO_{}_n{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE)
+if USE_ENTROPY_WEIGHT:
+    SAVE_FOLDER_NAME = "POMO_{}_n{}-Entropy_g{}".format(
+        PROBLEM_TYPE.upper(), PROBLEM_SIZE, ENTROPY_GAMMA)
+else:
+    SAVE_FOLDER_NAME = "POMO_{}_n{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE)
 print(SAVE_FOLDER_NAME)
 
 import os
