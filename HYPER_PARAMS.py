@@ -39,10 +39,20 @@ LR_MILESTONES  = [381, 391]
 LR_GAMMA       = 0.1
 
 # ===========================================================================
-# Entropy-Weighted Advantage Modulation
+# Entropy-Weighted Advantage Modulation (scheme: per-step reweight)
 # ===========================================================================
-USE_ENTROPY_WEIGHT   = True        # False = original POMO baseline
+USE_ENTROPY_WEIGHT   = True        # False = disable per-step reweight
 ENTROPY_GAMMA        = 0.1         # softmax temperature (larger = sharper)
+
+# ===========================================================================
+# Entropy Regularization Bonus (scheme A: standard A2C/PPO-style)
+#   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)
+#   beta > 0  -> encourage exploration (higher entropy)
+#   beta < 0  -> encourage commitment  (lower entropy)
+# Independent of USE_ENTROPY_WEIGHT; can be combined or used alone.
+# ===========================================================================
+USE_ENTROPY_BONUS    = False
+ENTROPY_BONUS_BETA   = 0.01
 
 # ===========================================================================
 # Checkpoint & Resume

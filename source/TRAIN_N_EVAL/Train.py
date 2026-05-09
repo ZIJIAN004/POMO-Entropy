@@ -1,8 +1,8 @@
 """
-Train.py — POMO REINFORCE with optional entropy-weighted advantage modulation
+Train.py — POMO REINFORCE with optional entropy schemes
 
 advantage_i = r_i - mean_j(r_j)
-loss = -mean(advantage * weighted_log_prob)
+loss = -mean(advantage * (weighted_)log_prob) - beta * mean(entropy)
 """
 
 import time
@@ -13,6 +13,8 @@ from source.utilities import Average_Meter
 
 if USE_ENTROPY_WEIGHT:
     from source.entropy_utils import compute_entropy_weights
+
+_COLLECT_ENTROPY = USE_ENTROPY_WEIGHT or USE_ENTROPY_BONUS
 
 
 def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
@@ -35,16 +37,18 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         model.pre_forward(reset_state)
 
         prob_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+        if _COLLECT_ENTROPY:
+            entropy_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
         if USE_ENTROPY_WEIGHT:
-            entropy_list    = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
             n_feasible_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
 
         state, reward, done = env.pre_step()
 
         while not done:
             selected, prob, entropy = model(state)
+            if _COLLECT_ENTROPY:
+                entropy_list = torch.cat((entropy_list, entropy[:, :, None]), dim=2)
             if USE_ENTROPY_WEIGHT:
-                entropy_list    = torch.cat((entropy_list, entropy[:, :, None]), dim=2)
                 n_feasible_list = torch.cat((n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
             state, reward, done = env.step(selected)
             prob_list = torch.cat((prob_list, prob[:, :, None]), dim=2)
@@ -62,6 +66,9 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             log_prob = prob_list.log().sum(dim=2)
 
         loss = -(advantage * log_prob).mean()
+
+        if USE_ENTROPY_BONUS:
+            loss = loss - ENTROPY_BONUS_BETA * entropy_list.mean()
 
         optimizer.zero_grad()
         loss.backward()

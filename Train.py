@@ -23,11 +23,12 @@ if _args.size is not None:
 
 from HYPER_PARAMS import *
 
+_tag = ""
 if USE_ENTROPY_WEIGHT:
-    SAVE_FOLDER_NAME = "POMO_{}_n{}-Entropy_g{}".format(
-        PROBLEM_TYPE.upper(), PROBLEM_SIZE, ENTROPY_GAMMA)
-else:
-    SAVE_FOLDER_NAME = "POMO_{}_n{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE)
+    _tag += "-Entropy_g{}".format(ENTROPY_GAMMA)
+if USE_ENTROPY_BONUS:
+    _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
+SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
 print(SAVE_FOLDER_NAME)
 
 import os
