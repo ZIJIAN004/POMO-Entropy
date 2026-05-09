@@ -42,7 +42,7 @@ LR_GAMMA       = 0.1
 # Entropy-Weighted Advantage Modulation (scheme: per-step reweight)
 # ===========================================================================
 USE_ENTROPY_WEIGHT   = True        # False = disable per-step reweight
-ENTROPY_GAMMA        = 0.1         # softmax temperature (larger = sharper)
+ENTROPY_GAMMA        = 1.0         # softmax temperature (larger = sharper)
 
 # ===========================================================================
 # Entropy Regularization Bonus (scheme A: standard A2C/PPO-style)
