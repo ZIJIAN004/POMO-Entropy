@@ -144,8 +144,12 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
                 batch_size, POMO_SIZE, T_total, inst_emb.size(-1))
 
             mlp_feats = baseline_module(features, inst_emb_per_step)
+            # entropy_list is the OLS target (y); detach so gradient flows ONLY
+            # through mlp_feats → MLP params, not back into the policy encoder/decoder.
+            # Otherwise loss_b.backward() frees model intermediates and the
+            # subsequent policy loss.backward() crashes with "graph freed".
             H_hat, _  = batched_per_instance_ols(
-                mlp_feats, entropy_list, valid, ridge=MLP_RIDGE)
+                mlp_feats, entropy_list.detach(), valid, ridge=MLP_RIDGE)
 
             # train MLP (every batch, including during warmup)
             if valid.any():
