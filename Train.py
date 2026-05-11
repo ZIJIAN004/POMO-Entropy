@@ -61,6 +61,8 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
+import matplotlib
+matplotlib.use('Agg')   # headless-safe: no display, no blocking plt.show()
 from matplotlib import pyplot as plt
 
 from source.utilities import Get_Logger, Extract_from_LogFile
@@ -133,6 +135,11 @@ if RESUME:
                                          map_location=device))
     lr_scheduler.load_state_dict(torch.load(os.path.join(RESUME_CKPT_PATH, 'LRSTEP_state_dic.pt'),
                                              map_location=device))
+    # 从目录名解析 epoch：CheckPoint_ep00050 → 50
+    ckpt_dir_name = os.path.basename(RESUME_CKPT_PATH.rstrip('/\\'))
+    start_epoch = int(ckpt_dir_name.split('ep')[-1]) + 1
+    logger.info('Resumed from {} (start_epoch={})'.format(RESUME_CKPT_PATH, start_epoch))
+
     if baseline_module is not None:
         bp = os.path.join(RESUME_CKPT_PATH, 'BASELINE_state_dic.pt')
         bo = os.path.join(RESUME_CKPT_PATH, 'BASELINE_OPTIM_state_dic.pt')
@@ -141,12 +148,24 @@ if RESUME:
             baseline_optim.load_state_dict(torch.load(bo, map_location=device))
             logger.info('Resumed baseline from {}'.format(bp))
         else:
-            logger.info('No baseline ckpt found in {}; starting fresh baseline.'
-                        .format(RESUME_CKPT_PATH))
-    # 从目录名解析 epoch：CheckPoint_ep00050 → 50
-    ckpt_dir_name = os.path.basename(RESUME_CKPT_PATH.rstrip('/\\'))
-    start_epoch = int(ckpt_dir_name.split('ep')[-1]) + 1
-    logger.info('Resumed from {} (start_epoch={})'.format(RESUME_CKPT_PATH, start_epoch))
+            # Fresh baseline + resumed model past the original warmup → the
+            # untrained MLP would otherwise be USED immediately for reweighting,
+            # which harms training. Shift warmup so the fresh MLP gets the
+            # full MLP_WARMUP_EPOCHS to converge first.
+            if start_epoch > MLP_WARMUP_EPOCHS:
+                old_end = MLP_WARMUP_EPOCHS
+                _HP.MLP_WARMUP_EPOCHS = start_epoch + MLP_WARMUP_EPOCHS - 1
+                # Note: TRAIN already imported HYPER_PARAMS, so we patch its
+                # module globals so the new threshold takes effect.
+                import source.TRAIN_N_EVAL.Train as _train_mod
+                _train_mod.MLP_WARMUP_EPOCHS = _HP.MLP_WARMUP_EPOCHS
+                logger.info(
+                    'No baseline ckpt found in {}; starting fresh MLP and '
+                    'shifting warmup from ep≤{} to ep≤{} so it can converge.'
+                    .format(RESUME_CKPT_PATH, old_end, _HP.MLP_WARMUP_EPOCHS))
+            else:
+                logger.info('No baseline ckpt found in {}; starting fresh baseline.'
+                            .format(RESUME_CKPT_PATH))
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 timer_start       = time.time()
@@ -187,4 +206,4 @@ plt.title('POMO {} – N={}'.format(PROBLEM_TYPE.upper(), PROBLEM_SIZE))
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(os.path.join(result_folder_path, 'eval_result.jpg'))
-plt.show()
+plt.close()
