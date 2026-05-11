@@ -21,14 +21,15 @@ class Reset_State:
 
 @dataclass
 class Step_State:
-    BATCH_IDX:      torch.Tensor = None
-    POMO_IDX:       torch.Tensor = None
-    selected_count: int          = None
-    current_node:   torch.Tensor = None
-    current_time:   torch.Tensor = None   # (batch, pomo)
-    ninf_mask:      torch.Tensor = None
-    finished:       torch.Tensor = None
-    n_feasible:     torch.Tensor = None
+    BATCH_IDX:              torch.Tensor = None
+    POMO_IDX:               torch.Tensor = None
+    selected_count:         int          = None
+    current_node:           torch.Tensor = None
+    current_time:           torch.Tensor = None   # (batch, pomo)
+    ninf_mask:              torch.Tensor = None
+    finished:               torch.Tensor = None
+    n_feasible:             torch.Tensor = None
+    visited_customer_count: torch.Tensor = None
 
 
 class VRPTWEnv:
@@ -69,6 +70,8 @@ class VRPTWEnv:
                                               self.problem_size + 1, device=self.device)
         self.finished          = torch.zeros(self.batch_size, self.pomo_size,
                                               dtype=torch.bool, device=self.device)
+        self.visited_customer_count = torch.zeros(self.batch_size, self.pomo_size,
+                                                   device=self.device)
         return self.reset_state, None, False
 
     def pre_step(self):
@@ -82,6 +85,9 @@ class VRPTWEnv:
             (self.selected_node_list, selected[:, :, None]), dim=2)
 
         self.at_the_depot = (selected == 0)
+
+        # 累计客户访问数（depot 不计）
+        self.visited_customer_count = self.visited_customer_count + (~self.at_the_depot).float()
 
         # 计算到达时间
         if self.selected_count >= 2:
@@ -130,12 +136,13 @@ class VRPTWEnv:
         self.ninf_mask[too_late] = float('-inf')
 
     def _sync(self):
-        self.step_state.selected_count = self.selected_count
-        self.step_state.current_node   = self.current_node
-        self.step_state.current_time   = self.current_time
-        self.step_state.ninf_mask      = self.ninf_mask
-        self.step_state.finished       = self.finished
-        self.step_state.n_feasible     = (self.ninf_mask == 0).sum(dim=2)
+        self.step_state.selected_count         = self.selected_count
+        self.step_state.current_node           = self.current_node
+        self.step_state.current_time           = self.current_time
+        self.step_state.ninf_mask              = self.ninf_mask
+        self.step_state.finished               = self.finished
+        self.step_state.n_feasible             = (self.ninf_mask == 0).sum(dim=2)
+        self.step_state.visited_customer_count = self.visited_customer_count
 
     def _get_travel_distance(self):
         idx = self.selected_node_list[:, :, :, None].expand(-1, -1, -1, 2)

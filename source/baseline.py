@@ -153,6 +153,53 @@ def extract_state_features_vrptw(state, problem_size):
 
 
 # ---------------------------------------------------------------------------
+# Mode A feature extractors — direct OLS regressors (NOT routed through MLP).
+# Last column is always the intercept (constant 1).
+# ---------------------------------------------------------------------------
+
+def extract_mode_a_features_tsp(state, problem_size):
+    """TSP Mode A: [log F, 1]  (2 features)."""
+    nf = state.n_feasible.float()
+    log_F = torch.log(nf.clamp(min=1.0))
+    return torch.stack([log_F, torch.ones_like(log_F)], dim=-1)   # (B, P, 2)
+
+
+def extract_mode_a_features_cvrp(state, problem_size):
+    """CVRP Mode A: [log F, load, at_depot, visited_customer_ratio, 1]  (5 features)."""
+    nf = state.n_feasible.float()
+    load = state.load
+    if state.current_node is None:
+        at_depot = torch.zeros_like(nf)
+    else:
+        at_depot = (state.current_node == 0).float()
+    vis_ratio = state.visited_customer_count / max(problem_size, 1)
+    return torch.stack([
+        torch.log(nf.clamp(min=1.0)),
+        load,
+        at_depot,
+        vis_ratio,
+        torch.ones_like(nf),
+    ], dim=-1)                                                     # (B, P, 5)
+
+
+def extract_mode_a_features_vrptw(state, problem_size):
+    """VRPTW Mode A: [log F, current_time, at_depot, visited_customer_ratio, 1] (5 features)."""
+    nf = state.n_feasible.float()
+    if state.current_node is None:
+        at_depot = torch.zeros_like(nf)
+    else:
+        at_depot = (state.current_node == 0).float()
+    vis_ratio = state.visited_customer_count / max(problem_size, 1)
+    return torch.stack([
+        torch.log(nf.clamp(min=1.0)),
+        state.current_time,
+        at_depot,
+        vis_ratio,
+        torch.ones_like(nf),
+    ], dim=-1)                                                     # (B, P, 5)
+
+
+# ---------------------------------------------------------------------------
 # weights computation (Mode B): uses residual = H - H_hat from MLP+OLS,
 # then performs the same group-by-F z-score → softmax × T_valid as the original
 # entropy_utils.compute_entropy_weights.

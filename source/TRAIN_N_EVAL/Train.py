@@ -1,12 +1,20 @@
 """
 Train.py — POMO REINFORCE with optional entropy schemes.
 
-Supported modes:
+Supported modes (mutually-exclusive priority: Mode B > Entropy-Weight > none):
   • baseline POMO (no reweighting)
-  • USE_ENTROPY_WEIGHT      : original log-F OLS based reweighting
-  • USE_ENTROPY_BONUS       : A2C-style entropy bonus
-  • USE_MODE_B_BASELINE     : shared MLP + per-instance OLS based reweighting
+  • USE_ENTROPY_WEIGHT      : Mode A — per-instance multivariate OLS on
+                              hand-crafted features
+                              (TSP: [log F, 1];  CVRP/VRPTW: [log F, load|time,
+                               at_depot, visited_customer_ratio, 1])
+  • USE_ENTROPY_BONUS       : A2C-style entropy bonus (can stack on top)
+  • USE_MODE_B_BASELINE     : Mode B — shared MLP + per-instance OLS
                               (overrides USE_ENTROPY_WEIGHT when set)
+
+Both Mode A and Mode B exclude
+  - forced steps (selected_count 0/1 → entropy = 0)
+  - finished padding (CVRP/VRPTW)
+from the OLS fit and from the softmax.
 
 advantage_i = r_i - mean_j(r_j)
 """
@@ -18,9 +26,22 @@ import torch.nn.functional as F
 from HYPER_PARAMS import *
 from source.utilities import Average_Meter
 
-if USE_ENTROPY_WEIGHT and not USE_MODE_B_BASELINE:
+# ── Mode A imports (only if Mode B is OFF) ───────────────────────────────────
+_USE_MODE_A = USE_ENTROPY_WEIGHT and not USE_MODE_B_BASELINE
+if _USE_MODE_A:
     from source.entropy_utils import compute_entropy_weights
+    from source.baseline import (
+        extract_mode_a_features_tsp,
+        extract_mode_a_features_cvrp,
+        extract_mode_a_features_vrptw,
+    )
+    _MODE_A_EXTRACTOR = {
+        'tsp':   extract_mode_a_features_tsp,
+        'cvrp':  extract_mode_a_features_cvrp,
+        'vrptw': extract_mode_a_features_vrptw,
+    }[PROBLEM_TYPE]
 
+# ── Mode B imports ───────────────────────────────────────────────────────────
 if USE_MODE_B_BASELINE:
     from source.baseline import (
         batched_per_instance_ols,
@@ -29,31 +50,44 @@ if USE_MODE_B_BASELINE:
         extract_state_features_cvrp,
         extract_state_features_vrptw,
     )
-    if PROBLEM_TYPE == 'tsp':
-        _EXTRACT_FEATS = extract_state_features_tsp
-    elif PROBLEM_TYPE == 'cvrp':
-        _EXTRACT_FEATS = extract_state_features_cvrp
-    elif PROBLEM_TYPE == 'vrptw':
-        _EXTRACT_FEATS = extract_state_features_vrptw
-    else:
-        raise ValueError(f"Mode B: unsupported PROBLEM_TYPE={PROBLEM_TYPE}")
+    _MODE_B_EXTRACTOR = {
+        'tsp':   extract_state_features_tsp,
+        'cvrp':  extract_state_features_cvrp,
+        'vrptw': extract_state_features_vrptw,
+    }[PROBLEM_TYPE]
+
 
 _COLLECT_ENTROPY = USE_ENTROPY_WEIGHT or USE_ENTROPY_BONUS or USE_MODE_B_BASELINE
+_COLLECT_FEATURES = _USE_MODE_A or USE_MODE_B_BASELINE
+_COLLECT_FINISHED = _COLLECT_FEATURES and PROBLEM_TYPE in ('cvrp', 'vrptw')
+
+
+def _make_valid_mask(T_total, batch_size, device, finished_list=None):
+    """forced-steps + finished padding → invalid; rest valid."""
+    valid = torch.ones(batch_size, POMO_SIZE, T_total, dtype=torch.bool, device=device)
+    forced_steps = 1 if PROBLEM_TYPE == 'tsp' else 2
+    if T_total > forced_steps:
+        valid[:, :, :forced_steps] = False
+    else:
+        valid[:] = False
+    if finished_list is not None:
+        valid &= ~finished_list
+    return valid
 
 
 def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
           baseline_module=None, baseline_optim=None):
     model.train()
 
-    score_AM      = Average_Meter()
-    loss_AM       = Average_Meter()
-    baseline_AM   = Average_Meter() if baseline_module is not None else None
+    score_AM    = Average_Meter()
+    loss_AM     = Average_Meter()
+    baseline_AM = Average_Meter() if baseline_module is not None else None
 
     logger_start = time.time()
     episode      = 0
     device       = next(model.parameters()).device
 
-    # whether to use mode-B residuals for reweighting (post-warmup)
+    # whether to use Mode B residuals for reweighting (post-warmup)
     use_mode_b_weights = (USE_MODE_B_BASELINE and
                           baseline_module is not None and
                           epoch > MODE_B_WARMUP_EPOCHS)
@@ -70,25 +104,26 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
         prob_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
         if _COLLECT_ENTROPY:
             entropy_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if USE_ENTROPY_WEIGHT or USE_MODE_B_BASELINE:
+        if _COLLECT_ENTROPY:
             n_feasible_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if USE_MODE_B_BASELINE:
-            state_feat_list = []                       # accumulate per step, stack later
-            finished_list   = torch.zeros(batch_size, POMO_SIZE, 0,
-                                          dtype=torch.bool, device=device) \
-                              if PROBLEM_TYPE in ('cvrp', 'vrptw') else None
+        if _COLLECT_FEATURES:
+            feat_list = []
+            finished_list = (torch.zeros(batch_size, POMO_SIZE, 0,
+                                          dtype=torch.bool, device=device)
+                             if _COLLECT_FINISHED else None)
 
         state, reward, done = env.pre_step()
 
         while not done:
             selected, prob, entropy = model(state)
             if _COLLECT_ENTROPY:
-                entropy_list = torch.cat((entropy_list, entropy[:, :, None]), dim=2)
-            if USE_ENTROPY_WEIGHT or USE_MODE_B_BASELINE:
+                entropy_list = torch.cat(
+                    (entropy_list, entropy[:, :, None]), dim=2)
                 n_feasible_list = torch.cat(
                     (n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
-            if USE_MODE_B_BASELINE:
-                state_feat_list.append(_EXTRACT_FEATS(state, PROBLEM_SIZE))   # (B, P, n_state)
+            if _COLLECT_FEATURES:
+                extractor = _MODE_B_EXTRACTOR if USE_MODE_B_BASELINE else _MODE_A_EXTRACTOR
+                feat_list.append(extractor(state, PROBLEM_SIZE))            # (B, P, d)
                 if finished_list is not None:
                     finished_list = torch.cat(
                         (finished_list, state.finished[:, :, None]), dim=2)
@@ -99,36 +134,22 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
         reward_f  = reward.float()
         advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
 
-        # ── Mode B: train baseline MLP + (optionally) compute residual weights ──
+        # ── Compute weighted log_prob (dispatch by mode) ─────────────────
         if USE_MODE_B_BASELINE and baseline_module is not None:
-            # (B, P, T, n_state)
-            state_feat = torch.stack(state_feat_list, dim=2)
-            T_total    = state_feat.size(2)
+            features = torch.stack(feat_list, dim=2)            # (B, P, T, n_state)
+            T_total  = features.size(2)
+            valid    = _make_valid_mask(T_total, batch_size, device, finished_list)
 
-            # validity mask: skip forced steps + finished padding
-            valid = torch.ones(batch_size, POMO_SIZE, T_total,
-                               dtype=torch.bool, device=device)
-            # steps 0 and 1 are forced (selected_count == 0/1 → entropy = 0)
-            forced_steps = 1 if PROBLEM_TYPE == 'tsp' else 2
-            if T_total > forced_steps:
-                valid[:, :, :forced_steps] = False
-            else:
-                valid[:] = False
-            if finished_list is not None:
-                valid &= ~finished_list
-
-            # instance embedding from policy encoder (DETACHED — encoder frozen
-            # w.r.t. baseline training)
-            inst_emb = model.encoded_nodes.mean(dim=1).detach()       # (B, embed_dim)
+            # instance embedding from policy encoder (DETACHED — encoder frozen)
+            inst_emb = model.encoded_nodes.mean(dim=1).detach()
             inst_emb_per_step = inst_emb[:, None, None, :].expand(
                 batch_size, POMO_SIZE, T_total, inst_emb.size(-1))
 
-            # forward MLP → per-instance closed-form OLS
-            features = baseline_module(state_feat, inst_emb_per_step)
-            H_hat, _ = batched_per_instance_ols(
-                features, entropy_list, valid, ridge=MODE_B_RIDGE)
+            mlp_feats = baseline_module(features, inst_emb_per_step)
+            H_hat, _  = batched_per_instance_ols(
+                mlp_feats, entropy_list, valid, ridge=MODE_B_RIDGE)
 
-            # train MLP (always, even during warmup)
+            # train MLP (every batch, including during warmup)
             if valid.any():
                 loss_b = F.mse_loss(H_hat[valid], entropy_list[valid].detach())
                 baseline_optim.zero_grad()
@@ -137,12 +158,12 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
                 if baseline_AM is not None:
                     baseline_AM.push(loss_b.detach().unsqueeze(0))
 
-            # post-warmup: recompute residual with frozen MLP for weight calc
+            # post-warmup: recompute residual under frozen MLP for weight calc
             if use_mode_b_weights:
                 with torch.no_grad():
-                    features_f = baseline_module(state_feat, inst_emb_per_step)
-                    H_hat_f, _ = batched_per_instance_ols(
-                        features_f, entropy_list, valid, ridge=MODE_B_RIDGE)
+                    mlp_feats_f = baseline_module(features, inst_emb_per_step)
+                    H_hat_f, _  = batched_per_instance_ols(
+                        mlp_feats_f, entropy_list, valid, ridge=MODE_B_RIDGE)
                 residual = entropy_list - H_hat_f
                 weights = compute_mode_b_weights(
                     residual, n_feasible_list, advantage, valid, gamma=ENTROPY_GAMMA)
@@ -150,10 +171,16 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
             else:
                 log_prob = prob_list.log().sum(dim=2)
 
-        elif USE_ENTROPY_WEIGHT:
-            weights  = compute_entropy_weights(
-                entropy_list, n_feasible_list, advantage, ENTROPY_GAMMA)
+        elif _USE_MODE_A:
+            features = torch.stack(feat_list, dim=2)            # (B, P, T, d)
+            T_total  = features.size(2)
+            valid    = _make_valid_mask(T_total, batch_size, device, finished_list)
+
+            weights = compute_entropy_weights(
+                entropy_list, features, n_feasible_list, advantage,
+                valid, gamma=ENTROPY_GAMMA)
             log_prob = (prob_list.log() * weights).sum(dim=2)
+
         else:
             log_prob = prob_list.log().sum(dim=2)
 
