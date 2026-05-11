@@ -6,7 +6,7 @@ sys.path.insert(0, '.')
 from source.baseline import (
     EntropyBaselineMLP,
     batched_per_instance_ols,
-    compute_mode_b_weights,
+    compute_residual_weights,
 )
 
 torch.manual_seed(0)
@@ -54,7 +54,7 @@ print(f"after 50 steps: {loss.item():.4f}")
 # === mode-B weights ===
 residual = H - H_hat
 advantage = torch.randn(B, P)
-weights = compute_mode_b_weights(residual, n_feas, advantage, valid, gamma=1.0)
+weights = compute_residual_weights(residual, n_feas, advantage, valid, gamma=1.0)
 print(f"weights shape: {weights.shape}")
 print(f"weights sum per (B,P): {weights.sum(dim=2)[0, :5].tolist()}  (should ≈ T_valid={valid[0, 0].sum().item()})")
 print(f"weights min/max: {weights.min().item():.4f}, {weights.max().item():.4f}")

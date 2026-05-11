@@ -1,17 +1,31 @@
 """
-POMO — REINFORCE with optional entropy-weighted advantage modulation
+POMO — REINFORCE with optional entropy-weighted advantage modulation.
 
 Run:
-    python Train.py                          # use HYPER_PARAMS defaults
-    python Train.py --problem tsp            # override problem type
-    python Train.py --problem cvrp --size 50 # override problem type and size
+    python Train.py                                  # use HYPER_PARAMS defaults
+    python Train.py --problem tsp                    # override problem type
+    python Train.py --problem cvrp --size 50         # override problem/size
+    python Train.py --problem tsp --mode mlp         # MLP-feature mode
+    python Train.py --problem tsp --mode hand        # hand-feature mode (direct OLS)
+    python Train.py --problem tsp --mode off         # baseline POMO, no reweight
+    python Train.py --problem tsp --mode mlp --warmup 20 --gamma 1.0
 """
 
 import argparse
 
 _parser = argparse.ArgumentParser()
-_parser.add_argument('--problem', type=str, default=None)
+_parser.add_argument('--problem', type=str, default=None,
+                     choices=['tsp', 'cvrp', 'vrptw'])
 _parser.add_argument('--size', type=int, default=None)
+_parser.add_argument('--mode', type=str, default=None,
+                     choices=['off', 'hand', 'mlp'],
+                     help='off: baseline POMO; '
+                          'hand: per-instance OLS on hand-crafted features; '
+                          'mlp:  per-instance OLS on MLP-learned features.')
+_parser.add_argument('--warmup', type=int, default=None,
+                     help='MLP warmup epochs (only used when --mode mlp).')
+_parser.add_argument('--gamma', type=float, default=None,
+                     help='softmax temperature for the entropy reweighting.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -20,14 +34,21 @@ if _args.problem is not None:
 if _args.size is not None:
     _HP.PROBLEM_SIZE = _args.size
     _HP.POMO_SIZE    = _args.size
+if _args.mode is not None:
+    _HP.USE_HAND_FEATURES = (_args.mode == 'hand')
+    _HP.USE_MLP_FEATURES  = (_args.mode == 'mlp')
+if _args.warmup is not None:
+    _HP.MLP_WARMUP_EPOCHS = _args.warmup
+if _args.gamma is not None:
+    _HP.ENTROPY_GAMMA = _args.gamma
 
 from HYPER_PARAMS import *
 
 _tag = ""
-if USE_MODE_B_BASELINE:
-    _tag += "-ModeB_g{}_w{}".format(ENTROPY_GAMMA, MODE_B_WARMUP_EPOCHS)
-elif USE_ENTROPY_WEIGHT:
-    _tag += "-Entropy_g{}".format(ENTROPY_GAMMA)
+if USE_MLP_FEATURES:
+    _tag += "-MLP_g{}_w{}".format(ENTROPY_GAMMA, MLP_WARMUP_EPOCHS)
+elif USE_HAND_FEATURES:
+    _tag += "-Hand_g{}".format(ENTROPY_GAMMA)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
@@ -79,26 +100,26 @@ model = Model(
 optimizer    = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 lr_scheduler = lr_sched.MultiStepLR(optimizer, milestones=LR_MILESTONES, gamma=LR_GAMMA)
 
-# ── Mode B baseline (optional) ───────────────────────────────────────────────
+# ── MLP-features baseline (optional) ─────────────────────────────────────────
 baseline_module = None
 baseline_optim  = None
-if USE_MODE_B_BASELINE:
+if USE_MLP_FEATURES:
     from source.baseline import EntropyBaselineMLP
     if PROBLEM_TYPE == 'tsp':
         n_state, h_out = 4, 4
     elif PROBLEM_TYPE in ('cvrp', 'vrptw'):
         n_state, h_out = 8, 8
     else:
-        raise ValueError(f"Mode B not configured for PROBLEM_TYPE={PROBLEM_TYPE}")
+        raise ValueError(f"MLP mode not configured for PROBLEM_TYPE={PROBLEM_TYPE}")
     baseline_module = EntropyBaselineMLP(
         n_state = n_state,
         n_inst  = EMBEDDING_DIM,
-        hidden  = MODE_B_HIDDEN,
+        hidden  = MLP_HIDDEN,
         h_out   = h_out,
     ).to(device)
     baseline_optim = optim.Adam(
         baseline_module.parameters(),
-        lr=MODE_B_LR, weight_decay=MODE_B_WEIGHT_DECAY)
+        lr=MLP_LR, weight_decay=MLP_WEIGHT_DECAY)
 
 env = Env(problem_size=PROBLEM_SIZE, pomo_size=POMO_SIZE)
 

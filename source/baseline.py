@@ -74,10 +74,10 @@ def batched_per_instance_ols(features, H, valid_mask, ridge=1e-4):
     return H_hat, beta
 
 
-def extract_state_features_tsp(state, problem_size):
+def extract_mlp_features_tsp(state, problem_size):
     """
-    TSP per-step state features (4 dims) — derived from `state` returned by env.
-    All tensors are (B, P).
+    TSP per-step state features fed INTO the MLP (4 dims).
+    Combined with the instance embedding inside EntropyBaselineMLP.
 
     Returns: (B, P, 4) float tensor
     """
@@ -93,10 +93,9 @@ def extract_state_features_tsp(state, problem_size):
     ], dim=-1)                               # (B, P, 4)
 
 
-def extract_state_features_cvrp(state, problem_size):
+def extract_mlp_features_cvrp(state, problem_size):
     """
-    CVRP per-step state features (8 dims).
-    All tensors are (B, P) at the time of the model decision.
+    CVRP per-step state features fed INTO the MLP (8 dims).
 
     At selected_count == 0 (env.pre_step), state.current_node is None — we
     return safe zero indicators for the depot-related features. These steps
@@ -125,9 +124,9 @@ def extract_state_features_cvrp(state, problem_size):
     ], dim=-1)                                         # (B, P, 8)
 
 
-def extract_state_features_vrptw(state, problem_size):
+def extract_mlp_features_vrptw(state, problem_size):
     """
-    VRPTW state features. Uses current_time instead of load.
+    VRPTW state features fed INTO the MLP. Uses current_time instead of load.
 
     Same None-guard as CVRP for current_node at selected_count == 0.
     """
@@ -153,19 +152,19 @@ def extract_state_features_vrptw(state, problem_size):
 
 
 # ---------------------------------------------------------------------------
-# Mode A feature extractors — direct OLS regressors (NOT routed through MLP).
-# Last column is always the intercept (constant 1).
+# Hand-feature extractors — fed DIRECTLY into per-instance OLS
+# (no MLP in between). Last column is always the intercept (constant 1).
 # ---------------------------------------------------------------------------
 
-def extract_mode_a_features_tsp(state, problem_size):
-    """TSP Mode A: [log F, 1]  (2 features)."""
+def extract_hand_features_tsp(state, problem_size):
+    """TSP hand features: [log F, 1]  (2 features)."""
     nf = state.n_feasible.float()
     log_F = torch.log(nf.clamp(min=1.0))
     return torch.stack([log_F, torch.ones_like(log_F)], dim=-1)   # (B, P, 2)
 
 
-def extract_mode_a_features_cvrp(state, problem_size):
-    """CVRP Mode A: [log F, load, at_depot, visited_customer_ratio, 1]  (5 features)."""
+def extract_hand_features_cvrp(state, problem_size):
+    """CVRP hand features: [log F, load, at_depot, visited_customer_ratio, 1]."""
     nf = state.n_feasible.float()
     load = state.load
     if state.current_node is None:
@@ -182,8 +181,8 @@ def extract_mode_a_features_cvrp(state, problem_size):
     ], dim=-1)                                                     # (B, P, 5)
 
 
-def extract_mode_a_features_vrptw(state, problem_size):
-    """VRPTW Mode A: [log F, current_time, at_depot, visited_customer_ratio, 1] (5 features)."""
+def extract_hand_features_vrptw(state, problem_size):
+    """VRPTW hand features: [log F, current_time, at_depot, visited_customer_ratio, 1]."""
     nf = state.n_feasible.float()
     if state.current_node is None:
         at_depot = torch.zeros_like(nf)
@@ -200,13 +199,12 @@ def extract_mode_a_features_vrptw(state, problem_size):
 
 
 # ---------------------------------------------------------------------------
-# weights computation (Mode B): uses residual = H - H_hat from MLP+OLS,
-# then performs the same group-by-F z-score → softmax × T_valid as the original
-# entropy_utils.compute_entropy_weights.
+# Shared downstream reweighting: given a per-step residual (computed via either
+# hand-feature OLS or MLP-feature OLS), do group-by-F z-score → softmax × T_valid.
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_mode_b_weights(residual, n_feasible, advantage, valid_mask, gamma):
+def compute_residual_weights(residual, n_feasible, advantage, valid_mask, gamma):
     """
     residual:   (B, P, T) — H - H_hat (already computed)
     n_feasible: (B, P, T) — for group-by-F z-score

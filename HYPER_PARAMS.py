@@ -39,37 +39,42 @@ LR_MILESTONES  = [381, 391]
 LR_GAMMA       = 0.1
 
 # ===========================================================================
-# Entropy-Weighted Advantage Modulation (scheme: per-step reweight)
+# Entropy-Weighted Advantage Modulation
+# Two feature schemes for the per-instance OLS baseline:
+#   • USE_HAND_FEATURES : hand-crafted features go directly into OLS
+#                         (TSP: [log F, 1]; CVRP/VRPTW: [log F, load|time,
+#                          at_depot, visited_customer_ratio, 1])
+#   • USE_MLP_FEATURES  : a shared small MLP produces h-dim features from
+#                         (hand-crafted state, instance_emb); per-instance
+#                         OLS is solved on top of those learned features
+#                         each batch.  Encoder is detached when feeding
+#                         into the MLP, so baseline training does NOT
+#                         backprop into the policy encoder.
+# When USE_MLP_FEATURES is True it overrides USE_HAND_FEATURES.
 # ===========================================================================
-USE_ENTROPY_WEIGHT   = True        # False = disable per-step reweight
+USE_HAND_FEATURES    = True        # Mode "hand" — direct OLS on hand-crafted feats
+USE_MLP_FEATURES     = True        # Mode "mlp"  — MLP-learned feats + OLS head
 ENTROPY_GAMMA        = 1.0         # softmax temperature (larger = sharper)
 
 # ===========================================================================
-# Entropy Regularization Bonus (scheme A: standard A2C/PPO-style)
+# Entropy Regularization Bonus (A2C/PPO-style — independent of the OLS path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)
 #   beta > 0  -> encourage exploration (higher entropy)
 #   beta < 0  -> encourage commitment  (lower entropy)
-# Independent of USE_ENTROPY_WEIGHT; can be combined or used alone.
+# Can be combined with either Hand/MLP mode or used alone.
 # ===========================================================================
 USE_ENTROPY_BONUS    = False
 ENTROPY_BONUS_BETA   = 0.01
 
 # ===========================================================================
-# Mode B Baseline (Learned Entropy Baseline)
-#   shared MLP φ_θ produces h-dim features from (state, instance_emb);
-#   per-instance β_b is solved via closed-form OLS each batch.
-#   residual = H - φ·β_b  → replaces (H - a·logF - b) in z-score pipeline.
-#
-#   Encoder is detached when feeding into the MLP (`.detach()` on encoded_nodes),
-#   so baseline training does NOT propagate gradients back into the policy encoder.
+# MLP-features mode hyperparameters (only used when USE_MLP_FEATURES = True)
 # ===========================================================================
-USE_MODE_B_BASELINE    = True       # if True, overrides USE_ENTROPY_WEIGHT
-MODE_B_WARMUP_EPOCHS   = 20         # epochs to train MLP without using its output
-                                    # (let encoder + MLP stabilize first)
-MODE_B_HIDDEN          = 16         # MLP hidden width
-MODE_B_LR              = 1e-3       # 10x policy LR — fast adapt to encoder changes
-MODE_B_WEIGHT_DECAY    = 1e-3
-MODE_B_RIDGE           = 1e-4       # ridge regularization for OLS
+MLP_WARMUP_EPOCHS    = 20          # epochs to train MLP without using its output
+                                   # (let encoder + MLP stabilize first)
+MLP_HIDDEN           = 16          # MLP hidden width
+MLP_LR               = 3e-4        # ~3x policy LR (1e-4) — track encoder a bit faster
+MLP_WEIGHT_DECAY     = 1e-3
+MLP_RIDGE            = 1e-4        # ridge regularization for per-instance OLS
 
 # ===========================================================================
 # Checkpoint & Resume
