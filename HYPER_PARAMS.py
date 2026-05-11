@@ -55,6 +55,23 @@ USE_ENTROPY_BONUS    = False
 ENTROPY_BONUS_BETA   = 0.01
 
 # ===========================================================================
+# Mode B Baseline (Learned Entropy Baseline)
+#   shared MLP φ_θ produces h-dim features from (state, instance_emb);
+#   per-instance β_b is solved via closed-form OLS each batch.
+#   residual = H - φ·β_b  → replaces (H - a·logF - b) in z-score pipeline.
+#
+#   Encoder is detached when feeding into the MLP (`.detach()` on encoded_nodes),
+#   so baseline training does NOT propagate gradients back into the policy encoder.
+# ===========================================================================
+USE_MODE_B_BASELINE    = True       # if True, overrides USE_ENTROPY_WEIGHT
+MODE_B_WARMUP_EPOCHS   = 20         # epochs to train MLP without using its output
+                                    # (let encoder + MLP stabilize first)
+MODE_B_HIDDEN          = 16         # MLP hidden width
+MODE_B_LR              = 1e-3       # 10x policy LR — fast adapt to encoder changes
+MODE_B_WEIGHT_DECAY    = 1e-3
+MODE_B_RIDGE           = 1e-4       # ridge regularization for OLS
+
+# ===========================================================================
 # Checkpoint & Resume
 # ===========================================================================
 RESUME                = False     # 是否从 checkpoint 断点续训

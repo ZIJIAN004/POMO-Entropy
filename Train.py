@@ -24,7 +24,9 @@ if _args.size is not None:
 from HYPER_PARAMS import *
 
 _tag = ""
-if USE_ENTROPY_WEIGHT:
+if USE_MODE_B_BASELINE:
+    _tag += "-ModeB_g{}_w{}".format(ENTROPY_GAMMA, MODE_B_WARMUP_EPOCHS)
+elif USE_ENTROPY_WEIGHT:
     _tag += "-Entropy_g{}".format(ENTROPY_GAMMA)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
@@ -77,6 +79,27 @@ model = Model(
 optimizer    = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 lr_scheduler = lr_sched.MultiStepLR(optimizer, milestones=LR_MILESTONES, gamma=LR_GAMMA)
 
+# ── Mode B baseline (optional) ───────────────────────────────────────────────
+baseline_module = None
+baseline_optim  = None
+if USE_MODE_B_BASELINE:
+    from source.baseline import EntropyBaselineMLP
+    if PROBLEM_TYPE == 'tsp':
+        n_state, h_out = 4, 4
+    elif PROBLEM_TYPE in ('cvrp', 'vrptw'):
+        n_state, h_out = 8, 8
+    else:
+        raise ValueError(f"Mode B not configured for PROBLEM_TYPE={PROBLEM_TYPE}")
+    baseline_module = EntropyBaselineMLP(
+        n_state = n_state,
+        n_inst  = EMBEDDING_DIM,
+        hidden  = MODE_B_HIDDEN,
+        h_out   = h_out,
+    ).to(device)
+    baseline_optim = optim.Adam(
+        baseline_module.parameters(),
+        lr=MODE_B_LR, weight_decay=MODE_B_WEIGHT_DECAY)
+
 env = Env(problem_size=PROBLEM_SIZE, pomo_size=POMO_SIZE)
 
 # ── 断点续训 ──────────────────────────────────────────────────────────────────
@@ -89,6 +112,16 @@ if RESUME:
                                          map_location=device))
     lr_scheduler.load_state_dict(torch.load(os.path.join(RESUME_CKPT_PATH, 'LRSTEP_state_dic.pt'),
                                              map_location=device))
+    if baseline_module is not None:
+        bp = os.path.join(RESUME_CKPT_PATH, 'BASELINE_state_dic.pt')
+        bo = os.path.join(RESUME_CKPT_PATH, 'BASELINE_OPTIM_state_dic.pt')
+        if os.path.isfile(bp) and os.path.isfile(bo):
+            baseline_module.load_state_dict(torch.load(bp, map_location=device))
+            baseline_optim.load_state_dict(torch.load(bo, map_location=device))
+            logger.info('Resumed baseline from {}'.format(bp))
+        else:
+            logger.info('No baseline ckpt found in {}; starting fresh baseline.'
+                        .format(RESUME_CKPT_PATH))
     # 从目录名解析 epoch：CheckPoint_ep00050 → 50
     ckpt_dir_name = os.path.basename(RESUME_CKPT_PATH.rstrip('/\\'))
     start_epoch = int(ckpt_dir_name.split('ep')[-1]) + 1
@@ -101,7 +134,8 @@ checkpoint_epochs = set(np.arange(1, TOTAL_EPOCH + 1, MODEL_SAVE_INTERVAL).tolis
 for epoch in range(start_epoch, TOTAL_EPOCH + 1):
 
     TRAIN(model, env, optimizer, lr_scheduler,
-          epoch=epoch, timer_start=timer_start, logger=logger)
+          epoch=epoch, timer_start=timer_start, logger=logger,
+          baseline_module=baseline_module, baseline_optim=baseline_optim)
     EVAL(model, env, epoch=epoch, timer_start=timer_start,
          logger=logger, result_folder_path=result_folder_path)
 
@@ -111,6 +145,11 @@ for epoch in range(start_epoch, TOTAL_EPOCH + 1):
         torch.save(model.state_dict(), os.path.join(ckpt_path, 'MODEL_state_dic.pt'))
         torch.save(optimizer.state_dict(), os.path.join(ckpt_path, 'OPTIM_state_dic.pt'))
         torch.save(lr_scheduler.state_dict(), os.path.join(ckpt_path, 'LRSTEP_state_dic.pt'))
+        if baseline_module is not None:
+            torch.save(baseline_module.state_dict(),
+                       os.path.join(ckpt_path, 'BASELINE_state_dic.pt'))
+            torch.save(baseline_optim.state_dict(),
+                       os.path.join(ckpt_path, 'BASELINE_OPTIM_state_dic.pt'))
 
 torch.save(model.state_dict(), os.path.join(result_folder_path, 'MODEL_FINAL.pt'))
 logger.info('Training complete.')
