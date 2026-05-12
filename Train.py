@@ -107,17 +107,12 @@ baseline_module = None
 baseline_optim  = None
 if USE_MLP_FEATURES:
     from source.baseline import EntropyBaselineMLP
-    if PROBLEM_TYPE == 'tsp':
-        n_state, h_out = 4, 4
-    elif PROBLEM_TYPE in ('cvrp', 'vrptw'):
-        n_state, h_out = 8, 8
-    else:
-        raise ValueError(f"MLP mode not configured for PROBLEM_TYPE={PROBLEM_TYPE}")
+    from source.TRAIN_N_EVAL.Train import mlp_input_dim
+    n_in = mlp_input_dim(PROBLEM_TYPE, EMBEDDING_DIM)
     baseline_module = EntropyBaselineMLP(
-        n_state = n_state,
-        n_inst  = EMBEDDING_DIM,
-        hidden  = MLP_HIDDEN,
-        h_out   = h_out,
+        n_in   = n_in,
+        hidden = MLP_HIDDEN,
+        h_out  = MLP_H_OUT,
     ).to(device)
     baseline_optim = optim.Adam(
         baseline_module.parameters(),

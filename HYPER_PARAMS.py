@@ -44,12 +44,15 @@ LR_GAMMA       = 0.1
 #   • USE_HAND_FEATURES : hand-crafted features go directly into OLS
 #                         (TSP: [log F, 1]; CVRP/VRPTW: [log F, load|time,
 #                          at_depot, visited_customer_ratio, 1])
-#   • USE_MLP_FEATURES  : a shared small MLP produces h-dim features from
-#                         (hand-crafted state, instance_emb); per-instance
-#                         OLS is solved on top of those learned features
-#                         each batch.  Encoder is detached when feeding
-#                         into the MLP, so baseline training does NOT
-#                         backprop into the policy encoder.
+#   • USE_MLP_FEATURES  : end-to-end MLP baseline. Inputs are encoder-side
+#                         embeddings (inst_summary mean-pool, enc_last,
+#                         optionally enc_first) plus raw env scalars (F, sc,
+#                         load|current_time, current_xy, vis_count). NO
+#                         hand-engineered nonlinearities and NO decoder-side
+#                         tensors (no q / mh_out — those carry policy
+#                         selection-confidence and would absorb the signal
+#                         we want as OLS residual). All encoder outputs are
+#                         detached so baseline grads do NOT touch the policy.
 # When USE_MLP_FEATURES is True it overrides USE_HAND_FEATURES.
 # ===========================================================================
 USE_HAND_FEATURES    = True        # Mode "hand" — direct OLS on hand-crafted feats
@@ -68,10 +71,19 @@ ENTROPY_BONUS_BETA   = 0.01
 
 # ===========================================================================
 # MLP-features mode hyperparameters (only used when USE_MLP_FEATURES = True)
+#
+# Input = [inst_summary (D), enc_last (D), (enc_first (D) if TSP), raw_scalar (k)]
+#   TSP : 3D + 4 = 388 (with EMBEDDING_DIM=128)
+#   CVRP: 2D + 6 = 262
+#   VRPTW:2D + 6 = 262
+# Architecture: Linear(n_in, hidden) → ReLU → Linear(hidden, hidden) → ReLU →
+#               Linear(hidden, h_out)
+# Per-instance closed-form OLS solved on top of φ ∈ R^h_out each batch.
 # ===========================================================================
 MLP_WARMUP_EPOCHS    = 20          # epochs to train MLP without using its output
                                    # (let encoder + MLP stabilize first)
-MLP_HIDDEN           = 16          # MLP hidden width
+MLP_HIDDEN           = 64          # MLP hidden width (2 hidden layers, each this wide)
+MLP_H_OUT            = 8           # per-instance OLS feature dim (β has this many entries)
 MLP_LR               = 3e-4        # ~3x policy LR (1e-4) — track encoder a bit faster
 MLP_WEIGHT_DECAY     = 1e-3
 MLP_RIDGE            = 1e-4        # ridge regularization for per-instance OLS

@@ -1,24 +1,26 @@
 """
 Mode B baseline: shared MLP encoder + per-instance closed-form linear head.
 
+Input philosophy (MLP mode)
+===========================
+We feed the baseline ONLY policy-encoder outputs (instance environment
+representation) and raw env scalars. No hand-engineered nonlinearities
+(no log / ratio / square / interaction) — the MLP learns those itself.
+No decoder-side tensors (no `q`, no `mh_out`) — those carry policy
+selection-confidence and would absorb the very signal we want as residual.
+
+Concretely, the caller (Train.py) builds:
+    TSP : [inst_summary, enc_last, enc_first, F, sc, current_xy]      (3D + 4)
+    CVRP: [inst_summary, enc_last,            F, sc, load, current_xy, vis_count]  (2D + 6)
+and feeds the whole vector to EntropyBaselineMLP.forward(x).
+
 Architecture
 ============
-    state features (n_state)            instance embedding (n_inst, from policy encoder)
-              │                                          │
-              └──────────────────────┬───────────────────┘
-                                     │
-                              ┌──────▼──────┐
-                              │  Linear     │
-                              │  ReLU       │   ← shared θ across all instances
-                              │  Linear     │      trained jointly via MSE
-                              └──────┬──────┘
-                                     │
-                              φ ∈ R^h (learned features)
-                                     │
-                              ⟨φ, β_b⟩           ← per-instance linear head,
-                                     │             closed-form OLS each batch
-                                     ▼
-                                 H_hat
+    raw input  ── Linear ─ ReLU ─ Linear ─ ReLU ─ Linear ──►  φ ∈ R^h_out
+                                                                │
+                              ⟨φ, β_b⟩    ← per-instance OLS    │
+                                                                ▼
+                                                              H_hat
 """
 
 import torch
@@ -26,23 +28,25 @@ import torch.nn as nn
 
 
 class EntropyBaselineMLP(nn.Module):
-    """MLP that produces h-dim features for per-instance OLS."""
+    """MLP that produces h-dim features for per-instance OLS.
 
-    def __init__(self, n_state, n_inst, hidden, h_out):
+    Single-input interface: caller is responsible for concatenating
+    (inst_summary, enc_last, enc_first?, raw_scalar) before calling forward.
+    """
+
+    def __init__(self, n_in, hidden=64, h_out=8):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_state + n_inst, hidden),
+            nn.Linear(n_in,   hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, h_out),
         )
 
-    def forward(self, state_feat, inst_emb_per_step):
-        """
-        state_feat:        (B, P, T, n_state)
-        inst_emb_per_step: (B, P, T, n_inst)
-        Returns features:  (B, P, T, h_out)
-        """
-        return self.net(torch.cat([state_feat, inst_emb_per_step], dim=-1))
+    def forward(self, x):
+        """x: (..., n_in)  →  (..., h_out)."""
+        return self.net(x)
 
 
 def batched_per_instance_ols(features, H, valid_mask, ridge=1e-4):
@@ -72,83 +76,6 @@ def batched_per_instance_ols(features, H, valid_mask, ridge=1e-4):
     beta = torch.linalg.solve(XtX, Xty).squeeze(-1)         # (B, h)
     H_hat = (X @ beta.unsqueeze(-1)).squeeze(-1).reshape(B, P, T)
     return H_hat, beta
-
-
-def extract_mlp_features_tsp(state, problem_size):
-    """
-    TSP per-step state features fed INTO the MLP (4 dims).
-    Combined with the instance embedding inside EntropyBaselineMLP.
-
-    Returns: (B, P, 4) float tensor
-    """
-    nf = state.n_feasible.float()
-    sc = float(state.selected_count)
-    sc_norm = torch.full_like(nf, sc / max(problem_size, 1))
-
-    return torch.stack([
-        torch.log(nf.clamp(min=1.0)),       # log F
-        nf / problem_size,                   # mask fraction
-        sc_norm,                             # progress
-        sc_norm.square(),                    # quadratic progress
-    ], dim=-1)                               # (B, P, 4)
-
-
-def extract_mlp_features_cvrp(state, problem_size):
-    """
-    CVRP per-step state features fed INTO the MLP (8 dims).
-
-    At selected_count == 0 (env.pre_step), state.current_node is None — we
-    return safe zero indicators for the depot-related features. These steps
-    are masked out of the OLS fit anyway (forced_steps=2).
-
-    Returns: (B, P, 8) float tensor
-    """
-    nf = state.n_feasible.float()
-    load = state.load
-    if state.current_node is None:
-        at_depot = torch.zeros_like(nf)
-    else:
-        at_depot = (state.current_node == 0).float()
-    sc = float(state.selected_count)
-    sc_norm = torch.full_like(nf, sc / max(2 * problem_size, 1))  # ≤ 1 in normal CVRP
-
-    return torch.stack([
-        torch.log(nf.clamp(min=1.0)),                 # log F
-        nf / (problem_size + 1),                       # mask fraction
-        load,                                          # capacity remaining
-        at_depot,                                      # depot step indicator
-        torch.log(load.clamp(min=1e-3)),               # log load (different scale)
-        sc_norm,                                       # progress
-        1.0 - load,                                    # demand consumed
-        at_depot * (1.0 - sc_norm),                    # early-depot interaction
-    ], dim=-1)                                         # (B, P, 8)
-
-
-def extract_mlp_features_vrptw(state, problem_size):
-    """
-    VRPTW state features fed INTO the MLP. Uses current_time instead of load.
-
-    Same None-guard as CVRP for current_node at selected_count == 0.
-    """
-    nf = state.n_feasible.float()
-    if state.current_node is None:
-        at_depot = torch.zeros_like(nf)
-    else:
-        at_depot = (state.current_node == 0).float()
-    sc = float(state.selected_count)
-    sc_norm = torch.full_like(nf, sc / max(2 * problem_size, 1))
-    ct = state.current_time   # normalized in [0, ~1] typically
-
-    return torch.stack([
-        torch.log(nf.clamp(min=1.0)),
-        nf / (problem_size + 1),
-        ct,
-        at_depot,
-        sc_norm,
-        sc_norm.square(),
-        at_depot * (1.0 - sc_norm),
-        ct * (1.0 - at_depot),
-    ], dim=-1)                                         # (B, P, 8)
 
 
 # ---------------------------------------------------------------------------
