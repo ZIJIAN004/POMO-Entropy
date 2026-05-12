@@ -16,11 +16,15 @@ and feeds the whole vector to EntropyBaselineMLP.forward(x).
 
 Architecture
 ============
-    raw input  ── Linear ─ ReLU ─ Linear ─ ReLU ─ Linear ──►  φ ∈ R^h_out
-                                                                │
-                              ⟨φ, β_b⟩    ← per-instance OLS    │
-                                                                ▼
-                                                              H_hat
+    raw input  ── Linear ─ ReLU ─ Linear ──►  φ ∈ R^h_out
+                                               │
+                              ⟨φ, β_b⟩    ← per-instance OLS
+                                               ▼
+                                             H_hat
+
+Single hidden layer is enough: the MLP only needs to fit a handful of
+basic nonlinearities (log F, ratios, simple binary interactions) that
+sit between raw env scalars / encoder embeddings and the entropy target.
 """
 
 import torch
@@ -32,14 +36,13 @@ class EntropyBaselineMLP(nn.Module):
 
     Single-input interface: caller is responsible for concatenating
     (inst_summary, enc_last, enc_first?, raw_scalar) before calling forward.
+    Single hidden layer + ReLU — feature-processing, not deep learning.
     """
 
-    def __init__(self, n_in, hidden=64, h_out=8):
+    def __init__(self, n_in, hidden=32, h_out=8):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_in,   hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, h_out),
         )

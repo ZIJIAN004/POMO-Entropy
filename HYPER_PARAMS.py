@@ -76,13 +76,13 @@ ENTROPY_BONUS_BETA   = 0.01
 #   TSP : 3D + 4 = 388 (with EMBEDDING_DIM=128)
 #   CVRP: 2D + 6 = 262
 #   VRPTW:2D + 6 = 262
-# Architecture: Linear(n_in, hidden) → ReLU → Linear(hidden, hidden) → ReLU →
-#               Linear(hidden, h_out)
+# Architecture: Linear(n_in, hidden) → ReLU → Linear(hidden, h_out)
 # Per-instance closed-form OLS solved on top of φ ∈ R^h_out each batch.
+# Single hidden layer — baseline is feature-processing, not deep learning.
 # ===========================================================================
 MLP_WARMUP_EPOCHS    = 20          # epochs to train MLP without using its output
                                    # (let encoder + MLP stabilize first)
-MLP_HIDDEN           = 64          # MLP hidden width (2 hidden layers, each this wide)
+MLP_HIDDEN           = 32          # MLP hidden width (single hidden layer)
 MLP_H_OUT            = 8           # per-instance OLS feature dim (β has this many entries)
 MLP_LR               = 3e-4        # ~3x policy LR (1e-4) — track encoder a bit faster
 MLP_WEIGHT_DECAY     = 1e-3
