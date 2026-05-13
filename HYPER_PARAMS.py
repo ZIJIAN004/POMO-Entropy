@@ -39,54 +39,46 @@ LR_MILESTONES  = [381, 391]
 LR_GAMMA       = 0.1
 
 # ===========================================================================
-# Entropy-Weighted Advantage Modulation
-# Two feature schemes for the per-instance OLS baseline:
-#   • USE_HAND_FEATURES : hand-crafted features go directly into OLS
-#                         (TSP: [log F, 1]; CVRP/VRPTW: [log F, load|time,
-#                          at_depot, visited_customer_ratio, 1])
-#   • USE_MLP_FEATURES  : end-to-end MLP baseline. Inputs are encoder-side
-#                         embeddings (inst_summary mean-pool, enc_last,
-#                         optionally enc_first) plus raw env scalars (F, sc,
-#                         load|current_time, current_xy, vis_count). NO
-#                         hand-engineered nonlinearities and NO decoder-side
-#                         tensors (no q / mh_out — those carry policy
-#                         selection-confidence and would absorb the signal
-#                         we want as OLS residual). All encoder outputs are
-#                         detached so baseline grads do NOT touch the policy.
-# When USE_MLP_FEATURES is True it overrides USE_HAND_FEATURES.
+# Entropy-weighted advantage modulation (pure group-wise z-score)
+#
+# Pipeline:
+#   1. Partition every (instance) into groups by discrete env features:
+#        TSP : (n_feasible,)
+#        CVRP: (n_feasible, at_depot, load_bin, vis_ratio_bin)
+#               — load and vis_ratio are continuous in [0,1], each split into
+#                 ENTROPY_N_BINS equal-width bins.
+#   2. Within each group, compute mean/std of entropy.
+#        - Groups with < ENTROPY_MIN_GROUP_SIZE valid steps: ΔH = 0 (no perturb)
+#   3. ΔH_t = (entropy_t - grp_mean) / grp_std    — per-step "confidence" signal
+#                                                   stripped of env-driven entropy.
+#   4. Per-step perturbation: c_t = 1 + γ · sign(advantage) · ΔH_t
+#                                   (advantage<0 + low-ΔH ⇒ heavy punish on
+#                                    confident-but-wrong steps; high-ΔH errors
+#                                    forgiven because they're still exploring)
+#   5. Warmup: first ENTROPY_WARMUP_EPOCHS epochs run baseline POMO (c_t = 1)
+#      but still compute monitoring stats (top3 group concentration etc.).
+#
+# Monitoring (logged each period):
+#   • top3_concentration : per-instance, sum(top-3 group sizes) / total valid steps.
+#                          Expected to rise as policy converges (state homogenization).
+#   • small_group_ratio  : per-instance, fraction of valid steps falling in
+#                          undersized (<min_size) groups. Diagnostic for binning.
 # ===========================================================================
-USE_HAND_FEATURES    = True        # Mode "hand" — direct OLS on hand-crafted feats
-USE_MLP_FEATURES     = True        # Mode "mlp"  — MLP-learned feats + OLS head
-ENTROPY_GAMMA        = 1.0         # softmax temperature (larger = sharper)
+USE_ENTROPY_REWEIGHT     = True         # master switch: True = enable reweighting
+ENTROPY_GAMMA            = 0.3          # perturbation amplitude for c_t = 1+γ·sign(A)·ΔH_t
+ENTROPY_N_BINS           = 10           # equal-width bins per continuous feature
+ENTROPY_MIN_GROUP_SIZE   = 4            # groups smaller than this: ΔH = 0
+ENTROPY_WARMUP_EPOCHS    = 10           # epochs where ΔH is forced to 0 (monitoring only)
 
 # ===========================================================================
-# Entropy Regularization Bonus (A2C/PPO-style — independent of the OLS path)
+# Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)
 #   beta > 0  -> encourage exploration (higher entropy)
 #   beta < 0  -> encourage commitment  (lower entropy)
-# Can be combined with either Hand/MLP mode or used alone.
+# Can stack on top of the reweighting path or be used alone.
 # ===========================================================================
 USE_ENTROPY_BONUS    = False
 ENTROPY_BONUS_BETA   = 0.01
-
-# ===========================================================================
-# MLP-features mode hyperparameters (only used when USE_MLP_FEATURES = True)
-#
-# Input = [inst_summary (D), enc_last (D), (enc_first (D) if TSP), raw_scalar (k)]
-#   TSP : 3D + 4 = 388 (with EMBEDDING_DIM=128)
-#   CVRP: 2D + 6 = 262
-#   VRPTW:2D + 6 = 262
-# Architecture: Linear(n_in, hidden) → ReLU → Linear(hidden, h_out)
-# Per-instance closed-form OLS solved on top of φ ∈ R^h_out each batch.
-# Single hidden layer — baseline is feature-processing, not deep learning.
-# ===========================================================================
-MLP_WARMUP_EPOCHS    = 20          # epochs to train MLP without using its output
-                                   # (let encoder + MLP stabilize first)
-MLP_HIDDEN           = 32          # MLP hidden width (single hidden layer)
-MLP_H_OUT            = 8           # per-instance OLS feature dim (β has this many entries)
-MLP_LR               = 3e-4        # ~3x policy LR (1e-4) — track encoder a bit faster
-MLP_WEIGHT_DECAY     = 1e-3
-MLP_RIDGE            = 1e-4        # ridge regularization for per-instance OLS
 
 # ===========================================================================
 # Checkpoint & Resume

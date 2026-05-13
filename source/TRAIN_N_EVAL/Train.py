@@ -1,147 +1,31 @@
 """
-Train.py — POMO REINFORCE with optional entropy schemes.
+Train.py — POMO REINFORCE with optional pure group-wise entropy reweighting.
 
-Supported modes (mutually exclusive priority: mlp > hand > none):
-  • baseline POMO (no reweighting)
-  • USE_HAND_FEATURES : per-instance multivariate OLS on hand-crafted features
-                        (TSP: [log F, 1]; CVRP/VRPTW: [log F, load|time,
-                         at_depot, visited_customer_ratio, 1])
-  • USE_MLP_FEATURES  : truly end-to-end MLP baseline.
-                        Input = [inst_summary, enc_last, (enc_first), raw_scalar]
-                        — all encoder-side or raw env, no decoder-side tensors
-                        (no q / mh_out), so the OLS residual still carries the
-                        policy selection-confidence signal we want to reweight.
-                        The MLP itself learns log / ratio / interaction terms.
-  • USE_ENTROPY_BONUS : A2C-style entropy bonus (can stack on top of either)
+Supported modes (mutually exclusive):
+  • USE_ENTROPY_REWEIGHT = False : baseline POMO (no reweighting)
+  • USE_ENTROPY_REWEIGHT = True  : per-step c_t = 1 + γ · sign(A) · ΔH_t
+                                   where ΔH is within-group z-score of entropy
+                                   over (instance, n_feasible[, at_depot,
+                                   load_bin, vis_ratio_bin]).
+                                   First ENTROPY_WARMUP_EPOCHS epochs run with
+                                   ΔH = 0 (baseline POMO) but still log
+                                   monitoring stats.
 
-Both the hand- and the MLP-feature paths exclude:
-  - forced steps (selected_count 0/1 → entropy = 0)
-  - finished padding (CVRP/VRPTW)
-from the OLS fit and from the softmax.
+  • USE_ENTROPY_BONUS  : A2C-style entropy bonus (independent, can stack)
+
+Excluded from the group statistics & from the gradient via valid_mask:
+  - forced steps  (TSP: step 0; CVRP/VRPTW: steps 0-1)
+  - finished padding steps (CVRP/VRPTW)
 
 advantage_i = r_i - mean_j(r_j)
 """
 
 import time
 import torch
-import torch.nn.functional as F
 
 from HYPER_PARAMS import *
 from source.utilities import Average_Meter
-from source.models.common import get_encoding
-
-# ── hand-feature imports (only if MLP mode is OFF) ───────────────────────────
-_USE_HAND = USE_HAND_FEATURES and not USE_MLP_FEATURES
-if _USE_HAND:
-    from source.entropy_utils import compute_entropy_weights
-    from source.baseline import (
-        extract_hand_features_tsp,
-        extract_hand_features_cvrp,
-        extract_hand_features_vrptw,
-    )
-    _HAND_EXTRACTOR = {
-        'tsp':   extract_hand_features_tsp,
-        'cvrp':  extract_hand_features_cvrp,
-        'vrptw': extract_hand_features_vrptw,
-    }[PROBLEM_TYPE]
-
-# ── MLP-feature imports ──────────────────────────────────────────────────────
-if USE_MLP_FEATURES:
-    from source.baseline import (
-        batched_per_instance_ols,
-        compute_residual_weights,
-    )
-
-
-_COLLECT_ENTROPY  = USE_HAND_FEATURES or USE_ENTROPY_BONUS or USE_MLP_FEATURES
-_COLLECT_FEATURES = _USE_HAND or USE_MLP_FEATURES
-_COLLECT_FINISHED = _COLLECT_FEATURES and PROBLEM_TYPE in ('cvrp', 'vrptw')
-
-
-# ─── MLP-mode step-embedding builders ────────────────────────────────────────
-# Pure policy-encoder outputs (instance representation) + raw env scalars.
-# NO decoder-side tensors. NO hand-engineered nonlinearities. MLP learns those.
-
-def mlp_input_dim(problem_type, embed_dim):
-    """Total dimension of the per-step MLP input vector."""
-    if problem_type == 'tsp':
-        # inst_summary + enc_last + enc_first + [F, sc, current_xy_x, current_xy_y]
-        return 3 * embed_dim + 4
-    elif problem_type == 'cvrp':
-        # inst_summary + enc_last + [F, sc, load, current_xy_x, current_xy_y, vis_count]
-        return 2 * embed_dim + 6
-    elif problem_type == 'vrptw':
-        # inst_summary + enc_last + [F, sc, current_time, current_xy_x, current_xy_y, vis_count]
-        return 2 * embed_dim + 6
-    else:
-        raise ValueError(f"Unknown problem_type: {problem_type}")
-
-
-def _build_step_emb(model, state, env, problem_type, n_in):
-    """
-    Returns (B, P, n_in). Forced steps (state.current_node is None) get zeros,
-    which is fine because valid_mask excludes them from OLS and softmax.
-
-    All embeddings are detached: baseline never backprops into the policy.
-    """
-    B = state.BATCH_IDX.size(0)
-    P = state.BATCH_IDX.size(1)
-    enc_nodes = model.encoded_nodes
-    D = enc_nodes.size(-1)
-    device = enc_nodes.device
-
-    if state.current_node is None:
-        # forced step (CVRP/VRPTW selected_count==0, TSP selected_count==0)
-        return torch.zeros(B, P, n_in, device=device)
-
-    # instance summary: step-independent → in per-instance OLS it acts as bias,
-    # but it also lets the MLP switch ReLU paths per-instance (instance-conditional
-    # nonlinearity), so we keep it.
-    inst_summary = enc_nodes.mean(dim=1).detach()                           # (B, D)
-    inst_summary = inst_summary[:, None, :].expand(B, P, D)                 # (B, P, D)
-
-    enc_last = get_encoding(enc_nodes, state.current_node).detach()         # (B, P, D)
-
-    # ── per-problem raw env scalars (NO log/ratio/square — MLP learns) ──
-    F_t  = state.n_feasible.float()                                          # (B, P)
-    sc_t = torch.full_like(F_t, float(state.selected_count))                 # (B, P)
-
-    cur_idx = state.current_node                                             # (B, P)
-
-    if problem_type == 'tsp':
-        enc_first = get_encoding(enc_nodes, model.first_node).detach()       # (B, P, D)
-        node_xy_exp = env.node_xy[:, None, :, :].expand(B, P, -1, 2)         # (B, P, N, 2)
-        current_xy = node_xy_exp.gather(
-            2, cur_idx[..., None, None].expand(B, P, 1, 2)).squeeze(2)       # (B, P, 2)
-        raw = torch.cat([F_t[..., None], sc_t[..., None], current_xy], dim=-1)   # (B, P, 4)
-        return torch.cat([inst_summary, enc_last, enc_first, raw], dim=-1)       # (B, P, 3D+4)
-
-    elif problem_type == 'cvrp':
-        dnxy_exp = env.depot_node_xy[:, None, :, :].expand(B, P, -1, 2)      # (B, P, N+1, 2)
-        current_xy = dnxy_exp.gather(
-            2, cur_idx[..., None, None].expand(B, P, 1, 2)).squeeze(2)       # (B, P, 2)
-        load_t    = state.load                                                # (B, P)
-        visited_t = state.visited_customer_count.float()                      # (B, P)
-        raw = torch.cat([
-            F_t[..., None], sc_t[..., None], load_t[..., None],
-            current_xy, visited_t[..., None],
-        ], dim=-1)                                                            # (B, P, 6)
-        return torch.cat([inst_summary, enc_last, raw], dim=-1)               # (B, P, 2D+6)
-
-    elif problem_type == 'vrptw':
-        dnxy_exp = env.depot_node_xy[:, None, :, :].expand(B, P, -1, 2)      # (B, P, N+1, 2)
-        current_xy = dnxy_exp.gather(
-            2, cur_idx[..., None, None].expand(B, P, 1, 2)).squeeze(2)       # (B, P, 2)
-        ct_t      = state.current_time                                        # (B, P)
-        visited_t = state.visited_customer_count.float()                      # (B, P)
-        raw = torch.cat([
-            F_t[..., None], sc_t[..., None], ct_t[..., None],
-            current_xy, visited_t[..., None],
-        ], dim=-1)                                                            # (B, P, 6)
-        return torch.cat([inst_summary, enc_last, raw], dim=-1)               # (B, P, 2D+6)
-
-    else:
-        raise ValueError(f"Unknown problem_type: {problem_type}")
+from source.baseline import build_group_id, compute_entropy_z_weights
 
 
 def _make_valid_mask(T_total, batch_size, device, finished_list=None):
@@ -157,26 +41,30 @@ def _make_valid_mask(T_total, batch_size, device, finished_list=None):
     return valid
 
 
-def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
-          baseline_module=None, baseline_optim=None):
+def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     model.train()
 
-    score_AM    = Average_Meter()
-    loss_AM     = Average_Meter()
-    baseline_AM = Average_Meter() if baseline_module is not None else None
-    # diagnostic: MLP_MSE / Var(H[valid])  → indicates baseline strength
-    ratio_AM    = Average_Meter() if baseline_module is not None else None
+    score_AM = Average_Meter()
+    loss_AM  = Average_Meter()
+    top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
+    small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
 
     logger_start = time.time()
     episode      = 0
     device       = next(model.parameters()).device
 
-    n_in = mlp_input_dim(PROBLEM_TYPE, EMBEDDING_DIM) if USE_MLP_FEATURES else None
+    # True once warmup is done — apply the actual perturbation. During warmup
+    # we still compute group stats (for monitoring) but force ΔH = 0.
+    apply_pert = USE_ENTROPY_REWEIGHT and (epoch > ENTROPY_WARMUP_EPOCHS)
 
-    # whether to use MLP-feature residuals for reweighting (post-warmup)
-    use_mlp_weights = (USE_MLP_FEATURES and
-                       baseline_module is not None and
-                       epoch > MLP_WARMUP_EPOCHS)
+    if USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'vrptw':
+        raise NotImplementedError(
+            "USE_ENTROPY_REWEIGHT is not supported for vrptw yet; "
+            "set it to False in HYPER_PARAMS or pass --mode off.")
+
+    # Collect entropy + group-construction features only when reweighting is on.
+    collect_groups = USE_ENTROPY_REWEIGHT or USE_ENTROPY_BONUS
+    needs_cvrp_feats = (USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'cvrp')
 
     while episode < TRAIN_EPISODES:
         batch_size = min(TRAIN_BATCH_SIZE, TRAIN_EPISODES - episode)
@@ -188,32 +76,49 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
         model.pre_forward(reset_state)
 
         prob_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if _COLLECT_ENTROPY:
+        if collect_groups:
             entropy_list    = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
             n_feasible_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if _COLLECT_FEATURES:
-            feat_list = []
-            finished_list = (torch.zeros(batch_size, POMO_SIZE, 0,
-                                          dtype=torch.bool, device=device)
-                             if _COLLECT_FINISHED else None)
+        if needs_cvrp_feats:
+            at_depot_list  = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+            load_list      = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+            vis_ratio_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+        if PROBLEM_TYPE == 'cvrp' and USE_ENTROPY_REWEIGHT:
+            finished_list = torch.zeros(batch_size, POMO_SIZE, 0,
+                                         dtype=torch.bool, device=device)
+        else:
+            finished_list = None
 
         state, reward, done = env.pre_step()
 
         while not done:
             selected, prob, entropy = model(state)
-            if _COLLECT_ENTROPY:
+
+            if collect_groups:
                 entropy_list = torch.cat(
                     (entropy_list, entropy[:, :, None]), dim=2)
                 n_feasible_list = torch.cat(
                     (n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
-            if _COLLECT_FEATURES:
-                if USE_MLP_FEATURES:
-                    feat_list.append(_build_step_emb(model, state, env, PROBLEM_TYPE, n_in))
+
+            if needs_cvrp_feats:
+                if state.current_node is None:
+                    at_depot = torch.zeros(batch_size, POMO_SIZE, device=device)
                 else:
-                    feat_list.append(_HAND_EXTRACTOR(state, PROBLEM_SIZE))   # (B, P, d)
-                if finished_list is not None:
-                    finished_list = torch.cat(
-                        (finished_list, state.finished[:, :, None]), dim=2)
+                    at_depot = (state.current_node == 0).float()
+                at_depot_list = torch.cat(
+                    (at_depot_list, at_depot[:, :, None]), dim=2)
+
+                load_list = torch.cat(
+                    (load_list, state.load[:, :, None]), dim=2)
+
+                vis_step = state.visited_customer_count.float() / max(PROBLEM_SIZE, 1)
+                vis_ratio_list = torch.cat(
+                    (vis_ratio_list, vis_step[:, :, None]), dim=2)
+
+            if finished_list is not None:
+                finished_list = torch.cat(
+                    (finished_list, state.finished[:, :, None]), dim=2)
+
             state, reward, done = env.step(selected)
             prob_list = torch.cat((prob_list, prob[:, :, None]), dim=2)
 
@@ -221,57 +126,40 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
         reward_f  = reward.float()
         advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
 
-        # ── Compute weighted log_prob (dispatch by mode) ─────────────────
-        if USE_MLP_FEATURES and baseline_module is not None:
-            features = torch.stack(feat_list, dim=2)            # (B, P, T, n_in)
-            T_total  = features.size(2)
-            valid    = _make_valid_mask(T_total, batch_size, device, finished_list)
+        # ── Compute weighted log_prob ────────────────────────────────────
+        if USE_ENTROPY_REWEIGHT:
+            T_total = prob_list.size(2)
+            valid   = _make_valid_mask(T_total, batch_size, device, finished_list)
 
-            mlp_feats = baseline_module(features)               # (B, P, T, h_out)
-            # entropy_list is the OLS target (y); detach so gradient flows ONLY
-            # through mlp_feats → MLP params, not back into the policy encoder/decoder.
-            H_hat, _  = batched_per_instance_ols(
-                mlp_feats, entropy_list.detach(), valid, ridge=MLP_RIDGE)
-
-            # train MLP (every batch, including during warmup)
-            if valid.any():
-                H_target = entropy_list[valid].detach()
-                H_pred   = H_hat[valid]
-                loss_b   = F.mse_loss(H_pred, H_target)
-                baseline_optim.zero_grad()
-                loss_b.backward()
-                baseline_optim.step()
-                if baseline_AM is not None:
-                    baseline_AM.push(loss_b.detach().unsqueeze(0))
-                # diagnostic: MSE / Var(H[valid])
-                if ratio_AM is not None:
-                    var_H = H_target.var(unbiased=False).clamp(min=1e-12)
-                    ratio = (loss_b.detach() / var_H)
-                    ratio_AM.push(ratio.unsqueeze(0))
-
-            # post-warmup: recompute residual under frozen MLP for weight calc
-            if use_mlp_weights:
-                with torch.no_grad():
-                    mlp_feats_f = baseline_module(features)
-                    H_hat_f, _  = batched_per_instance_ols(
-                        mlp_feats_f, entropy_list, valid, ridge=MLP_RIDGE)
-                residual = entropy_list - H_hat_f
-                weights = compute_residual_weights(
-                    residual, n_feasible_list, advantage, valid, gamma=ENTROPY_GAMMA)
-                log_prob = (prob_list.log() * weights).sum(dim=2)
+            if PROBLEM_TYPE == 'tsp':
+                gid, n_grp = build_group_id(
+                    'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
             else:
-                log_prob = prob_list.log().sum(dim=2)
+                gid, n_grp = build_group_id(
+                    PROBLEM_TYPE,
+                    n_feasible=n_feasible_list,
+                    at_depot=at_depot_list,
+                    load=load_list,
+                    vis_ratio=vis_ratio_list,
+                    n_bins=ENTROPY_N_BINS,
+                )
 
-        elif _USE_HAND:
-            features = torch.stack(feat_list, dim=2)            # (B, P, T, d)
-            T_total  = features.size(2)
-            valid    = _make_valid_mask(T_total, batch_size, device, finished_list)
-
-            weights = compute_entropy_weights(
-                entropy_list, features, n_feasible_list, advantage,
-                valid, gamma=ENTROPY_GAMMA)
+            weights, diag = compute_entropy_z_weights(
+                entropy=entropy_list,
+                valid_mask=valid,
+                advantage=advantage,
+                gid=gid,
+                n_grp_per_inst=n_grp,
+                gamma=ENTROPY_GAMMA,
+                min_group_size=ENTROPY_MIN_GROUP_SIZE,
+                apply_perturbation=apply_pert,
+            )
             log_prob = (prob_list.log() * weights).sum(dim=2)
 
+            if top3_AM is not None:
+                top3_AM.push(diag['top3_concentration'].unsqueeze(0))
+            if small_AM is not None:
+                small_AM.push(diag['small_group_ratio'].unsqueeze(0))
         else:
             log_prob = prob_list.log().sum(dim=2)
 
@@ -292,11 +180,10 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger,
         if time.time() - logger_start > LOG_PERIOD_SEC or episode >= TRAIN_EPISODES:
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - timer_start))
             extra = ""
-            if baseline_AM is not None and baseline_AM.count > 0:
-                tag = "MLP(use)" if use_mlp_weights else "MLP(warmup)"
-                extra = "  {}_MSE:{:.4f}".format(tag, baseline_AM.result())
-                if ratio_AM is not None and ratio_AM.count > 0:
-                    extra += "  MSE/Var:{:.3f}".format(ratio_AM.result())
+            if top3_AM is not None and top3_AM.count > 0:
+                phase = "warmup" if not apply_pert else "active"
+                extra = "  Z({}):top3={:.3f} small={:.3f}".format(
+                    phase, top3_AM.result(), small_AM.result())
             logger.info('Ep:{:03d}-{:07d}({:5.1f}%)  T:{}  Loss:{:+.4f}  Avg.best_dist:{:.4f}{}'.format(
                 epoch, episode, 100. * episode / TRAIN_EPISODES,
                 elapsed, loss_AM.result(), score_AM.result(), extra))

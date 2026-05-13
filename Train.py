@@ -1,14 +1,12 @@
 """
-POMO — REINFORCE with optional entropy-weighted advantage modulation.
+POMO — REINFORCE with optional pure group-wise entropy reweighting.
 
 Run:
-    python Train.py                                  # use HYPER_PARAMS defaults
-    python Train.py --problem tsp                    # override problem type
-    python Train.py --problem cvrp --size 50         # override problem/size
-    python Train.py --problem tsp --mode mlp         # MLP-feature mode
-    python Train.py --problem tsp --mode hand        # hand-feature mode (direct OLS)
-    python Train.py --problem tsp --mode off         # baseline POMO, no reweight
-    python Train.py --problem tsp --mode mlp --warmup 20 --gamma 1.0
+    python Train.py                            # use HYPER_PARAMS defaults
+    python Train.py --problem tsp              # override problem type
+    python Train.py --problem cvrp --size 50   # override problem/size
+    python Train.py --problem tsp --mode off   # baseline POMO, no reweight
+    python Train.py --problem tsp --mode on --gamma 0.3 --warmup 10
 """
 
 import argparse
@@ -18,14 +16,12 @@ _parser.add_argument('--problem', type=str, default=None,
                      choices=['tsp', 'cvrp', 'vrptw'])
 _parser.add_argument('--size', type=int, default=None)
 _parser.add_argument('--mode', type=str, default=None,
-                     choices=['off', 'hand', 'mlp'],
-                     help='off: baseline POMO; '
-                          'hand: per-instance OLS on hand-crafted features; '
-                          'mlp:  per-instance OLS on MLP-learned features.')
+                     choices=['off', 'on'],
+                     help='off: baseline POMO; on: enable entropy reweighting.')
 _parser.add_argument('--warmup', type=int, default=None,
-                     help='MLP warmup epochs (only used when --mode mlp).')
+                     help='Epochs to delay perturbation (only monitoring during warmup).')
 _parser.add_argument('--gamma', type=float, default=None,
-                     help='softmax temperature for the entropy reweighting.')
+                     help='perturbation amplitude for c_t = 1+γ·sign(A)·ΔH_t.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -35,20 +31,17 @@ if _args.size is not None:
     _HP.PROBLEM_SIZE = _args.size
     _HP.POMO_SIZE    = _args.size
 if _args.mode is not None:
-    _HP.USE_HAND_FEATURES = (_args.mode == 'hand')
-    _HP.USE_MLP_FEATURES  = (_args.mode == 'mlp')
+    _HP.USE_ENTROPY_REWEIGHT = (_args.mode == 'on')
 if _args.warmup is not None:
-    _HP.MLP_WARMUP_EPOCHS = _args.warmup
+    _HP.ENTROPY_WARMUP_EPOCHS = _args.warmup
 if _args.gamma is not None:
     _HP.ENTROPY_GAMMA = _args.gamma
 
 from HYPER_PARAMS import *
 
 _tag = ""
-if USE_MLP_FEATURES:
-    _tag += "-MLP_g{}_w{}".format(ENTROPY_GAMMA, MLP_WARMUP_EPOCHS)
-elif USE_HAND_FEATURES:
-    _tag += "-Hand_g{}".format(ENTROPY_GAMMA)
+if USE_ENTROPY_REWEIGHT:
+    _tag += "-Z_g{}_w{}".format(ENTROPY_GAMMA, ENTROPY_WARMUP_EPOCHS)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
@@ -102,22 +95,6 @@ model = Model(
 optimizer    = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 lr_scheduler = lr_sched.MultiStepLR(optimizer, milestones=LR_MILESTONES, gamma=LR_GAMMA)
 
-# ── MLP-features baseline (optional) ─────────────────────────────────────────
-baseline_module = None
-baseline_optim  = None
-if USE_MLP_FEATURES:
-    from source.baseline import EntropyBaselineMLP
-    from source.TRAIN_N_EVAL.Train import mlp_input_dim
-    n_in = mlp_input_dim(PROBLEM_TYPE, EMBEDDING_DIM)
-    baseline_module = EntropyBaselineMLP(
-        n_in   = n_in,
-        hidden = MLP_HIDDEN,
-        h_out  = MLP_H_OUT,
-    ).to(device)
-    baseline_optim = optim.Adam(
-        baseline_module.parameters(),
-        lr=MLP_LR, weight_decay=MLP_WEIGHT_DECAY)
-
 env = Env(problem_size=PROBLEM_SIZE, pomo_size=POMO_SIZE)
 
 # ── 断点续训 ──────────────────────────────────────────────────────────────────
@@ -135,33 +112,6 @@ if RESUME:
     start_epoch = int(ckpt_dir_name.split('ep')[-1]) + 1
     logger.info('Resumed from {} (start_epoch={})'.format(RESUME_CKPT_PATH, start_epoch))
 
-    if baseline_module is not None:
-        bp = os.path.join(RESUME_CKPT_PATH, 'BASELINE_state_dic.pt')
-        bo = os.path.join(RESUME_CKPT_PATH, 'BASELINE_OPTIM_state_dic.pt')
-        if os.path.isfile(bp) and os.path.isfile(bo):
-            baseline_module.load_state_dict(torch.load(bp, map_location=device))
-            baseline_optim.load_state_dict(torch.load(bo, map_location=device))
-            logger.info('Resumed baseline from {}'.format(bp))
-        else:
-            # Fresh baseline + resumed model past the original warmup → the
-            # untrained MLP would otherwise be USED immediately for reweighting,
-            # which harms training. Shift warmup so the fresh MLP gets the
-            # full MLP_WARMUP_EPOCHS to converge first.
-            if start_epoch > MLP_WARMUP_EPOCHS:
-                old_end = MLP_WARMUP_EPOCHS
-                _HP.MLP_WARMUP_EPOCHS = start_epoch + MLP_WARMUP_EPOCHS - 1
-                # Note: TRAIN already imported HYPER_PARAMS, so we patch its
-                # module globals so the new threshold takes effect.
-                import source.TRAIN_N_EVAL.Train as _train_mod
-                _train_mod.MLP_WARMUP_EPOCHS = _HP.MLP_WARMUP_EPOCHS
-                logger.info(
-                    'No baseline ckpt found in {}; starting fresh MLP and '
-                    'shifting warmup from ep≤{} to ep≤{} so it can converge.'
-                    .format(RESUME_CKPT_PATH, old_end, _HP.MLP_WARMUP_EPOCHS))
-            else:
-                logger.info('No baseline ckpt found in {}; starting fresh baseline.'
-                            .format(RESUME_CKPT_PATH))
-
 # ── Training loop ─────────────────────────────────────────────────────────────
 timer_start       = time.time()
 checkpoint_epochs = set(np.arange(1, TOTAL_EPOCH + 1, MODEL_SAVE_INTERVAL).tolist())
@@ -169,8 +119,7 @@ checkpoint_epochs = set(np.arange(1, TOTAL_EPOCH + 1, MODEL_SAVE_INTERVAL).tolis
 for epoch in range(start_epoch, TOTAL_EPOCH + 1):
 
     TRAIN(model, env, optimizer, lr_scheduler,
-          epoch=epoch, timer_start=timer_start, logger=logger,
-          baseline_module=baseline_module, baseline_optim=baseline_optim)
+          epoch=epoch, timer_start=timer_start, logger=logger)
     EVAL(model, env, epoch=epoch, timer_start=timer_start,
          logger=logger, result_folder_path=result_folder_path)
 
@@ -180,11 +129,6 @@ for epoch in range(start_epoch, TOTAL_EPOCH + 1):
         torch.save(model.state_dict(), os.path.join(ckpt_path, 'MODEL_state_dic.pt'))
         torch.save(optimizer.state_dict(), os.path.join(ckpt_path, 'OPTIM_state_dic.pt'))
         torch.save(lr_scheduler.state_dict(), os.path.join(ckpt_path, 'LRSTEP_state_dic.pt'))
-        if baseline_module is not None:
-            torch.save(baseline_module.state_dict(),
-                       os.path.join(ckpt_path, 'BASELINE_state_dic.pt'))
-            torch.save(baseline_optim.state_dict(),
-                       os.path.join(ckpt_path, 'BASELINE_OPTIM_state_dic.pt'))
 
 torch.save(model.state_dict(), os.path.join(result_folder_path, 'MODEL_FINAL.pt'))
 logger.info('Training complete.')
