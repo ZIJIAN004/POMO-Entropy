@@ -76,7 +76,8 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 
 @torch.no_grad()
 def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_inst,
-                               gamma, min_group_size=4, apply_perturbation=True):
+                               gamma, min_group_size=4, apply_perturbation=True,
+                               use_bidir_norm=False, use_softmax_norm=False):
     """
     entropy:           (B, P, T) — model entropy at each step
     valid_mask:        (B, P, T) bool — True = real decision step
@@ -87,10 +88,18 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
     min_group_size:    int       — groups with fewer valid steps get ΔH = 0
     apply_perturbation: bool     — if False (warmup), forces ΔH = 0 everywhere
                                     but still computes monitoring stats.
+    use_bidir_norm:    bool      — if True, subtract per-trajectory mean from
+                                    entropy BEFORE the (instance, gid) z-score.
+                                    Removes the α_i trajectory offset that
+                                    drives within-bucket heteroscedasticity.
+    use_softmax_norm:  bool      — if True, c_t = softmax(γ·sign(A)·ΔH, dim=2)
+                                    · T_valid (guarantees c_t ≥ 0 and Σ_t c_t
+                                    = T_valid; also implicitly within-trajectory
+                                    centers ΔH). If False, linear c_t = 1+γ·…
 
     Returns:
-        w:    (B, P, T) — c_t = 1 + γ·sign(A)·ΔH_t (or 1 during warmup),
-                          invalid step = 0, small-group step = 1.
+        w:    (B, P, T) — c_t. invalid step = 0; small-group step = 1
+                          (linear mode) or uniform within softmax (softmax mode).
         diag: dict {
             'top3_concentration': scalar — mean over instances of
                                   sum(top-3 group sizes) / sum(all group sizes).
@@ -102,6 +111,17 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
     """
     B, P, T = entropy.shape
     device = entropy.device
+    vmf = valid_mask.float()
+
+    # ── (Optional) Bidirectional normalization: subtract per-trajectory mean.
+    #    Removes α_i so the subsequent (instance, gid) z-score sees only
+    #    within-bucket variance free of the trajectory offset.
+    if use_bidir_norm:
+        cnt_t = vmf.sum(dim=2, keepdim=True).clamp(min=1.0)           # (B, P, 1)
+        mu_t  = (entropy * vmf).sum(dim=2, keepdim=True) / cnt_t      # (B, P, 1)
+        H_in  = entropy - mu_t                                         # (B, P, T)
+    else:
+        H_in  = entropy
 
     # ── Flatten + add per-batch offset to gid so each instance gets its own
     #    block of [0, n_grp_per_inst) slots and groups never collide across
@@ -111,8 +131,8 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
     gid_global = bid * n_grp_per_inst + gid_flat                     # (B·P·T,)
     n_grp_total = B * n_grp_per_inst
 
-    v_flat = valid_mask.reshape(-1).float()
-    ent_flat = entropy.reshape(-1)
+    v_flat = vmf.reshape(-1)
+    ent_flat = H_in.reshape(-1)
 
     # ── Group statistics over entropy (valid steps only). ─────────────────────
     counts = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, v_flat)
@@ -136,10 +156,17 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
 
     delta_H = delta_H.reshape(B, P, T)
 
-    # ── Linear per-step perturbation c_t = 1 + γ·sign(A)·ΔH_t. ───────────────
+    # ── c_t: linear (1+γ·sign(A)·ΔH) or softmax(γ·sign(A)·ΔH)·T_valid ────────
     sign_A = advantage.sign().unsqueeze(2)                           # (B, P, 1)
-    w = 1.0 + gamma * sign_A * delta_H                               # (B, P, T)
-    w = w * valid_mask.float()                                       # invalid → 0
+    if use_softmax_norm:
+        logit   = gamma * sign_A * delta_H                           # (B, P, T)
+        logit   = logit.masked_fill(~valid_mask, -1e9)               # invalid → ≈0 after softmax
+        T_valid = vmf.sum(dim=2, keepdim=True).clamp(min=1.0)
+        w       = torch.softmax(logit, dim=2) * T_valid
+        w       = w * vmf                                             # invalid → 0 explicitly
+    else:
+        w = 1.0 + gamma * sign_A * delta_H                            # (B, P, T)
+        w = w * vmf                                                    # invalid → 0
 
     # ── Diagnostics: per-instance top-3 concentration & small-group ratio. ────
     # counts is (B · n_grp_per_inst,) → reshape to (B, n_grp_per_inst).

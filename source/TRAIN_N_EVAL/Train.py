@@ -153,6 +153,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 gamma=ENTROPY_GAMMA,
                 min_group_size=ENTROPY_MIN_GROUP_SIZE,
                 apply_perturbation=apply_pert,
+                use_bidir_norm=USE_BIDIR_NORM,
+                use_softmax_norm=USE_SOFTMAX_NORM,
             )
             log_prob = (prob_list.log() * weights).sum(dim=2)
 

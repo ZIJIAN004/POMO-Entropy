@@ -70,6 +70,20 @@ ENTROPY_N_BINS           = 10           # equal-width bins per continuous featur
 ENTROPY_MIN_GROUP_SIZE   = 4            # groups smaller than this: ΔH = 0
 ENTROPY_WARMUP_EPOCHS    = 10           # epochs where ΔH is forced to 0 (monitoring only)
 
+# ── Ablation switches (only effective when USE_ENTROPY_REWEIGHT = True) ─────
+# USE_BIDIR_NORM    : subtract per-trajectory mean BEFORE the (instance, gid)
+#                     z-score. Diagnostic-motivated: within-bucket variance is
+#                     dominated by per-trajectory entropy offset α_i; removing
+#                     it makes the z-score's homoscedasticity assumption hold.
+# USE_SOFTMAX_NORM  : c_t = softmax(γ·sign(A)·ΔH, dim=step) · T_valid
+#                     instead of c_t = 1 + γ·sign(A)·ΔH. Guarantees c_t ≥ 0
+#                     and Σ_t c_t = T_valid, and implicitly does an extra
+#                     within-trajectory centering (small-γ Taylor).
+# 4 combinations form the ablation grid. Default (False, False) = current
+# linear baseline.
+USE_BIDIR_NORM           = False
+USE_SOFTMAX_NORM         = False
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)

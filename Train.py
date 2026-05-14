@@ -22,6 +22,12 @@ _parser.add_argument('--warmup', type=int, default=None,
                      help='Epochs to delay perturbation (only monitoring during warmup).')
 _parser.add_argument('--gamma', type=float, default=None,
                      help='perturbation amplitude for c_t = 1+γ·sign(A)·ΔH_t.')
+_parser.add_argument('--bidir', type=str, default=None, choices=['on', 'off'],
+                     help='bidirectional normalization: subtract per-trajectory '
+                          'mean before bucket z-score.')
+_parser.add_argument('--softmax', type=str, default=None, choices=['on', 'off'],
+                     help='softmax c_t = softmax(γ·sign(A)·ΔH, dim=step)·T_valid '
+                          'instead of linear c_t = 1+γ·sign(A)·ΔH.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -36,12 +42,20 @@ if _args.warmup is not None:
     _HP.ENTROPY_WARMUP_EPOCHS = _args.warmup
 if _args.gamma is not None:
     _HP.ENTROPY_GAMMA = _args.gamma
+if _args.bidir is not None:
+    _HP.USE_BIDIR_NORM = (_args.bidir == 'on')
+if _args.softmax is not None:
+    _HP.USE_SOFTMAX_NORM = (_args.softmax == 'on')
 
 from HYPER_PARAMS import *
 
 _tag = ""
 if USE_ENTROPY_REWEIGHT:
     _tag += "-Z_g{}_w{}".format(ENTROPY_GAMMA, ENTROPY_WARMUP_EPOCHS)
+    if USE_BIDIR_NORM:
+        _tag += "-Bd"
+    if USE_SOFTMAX_NORM:
+        _tag += "-Sm"
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)

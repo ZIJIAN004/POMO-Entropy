@@ -105,4 +105,57 @@ print(f"[5] CVRP end-to-end: mean(w|valid)={v_mean_cv:.3f}, "
       f"small_group_ratio={diag_cv['small_group_ratio'].item():.3f} ✓")
 
 
+# === (6) Bidir + softmax ablation switches ===================================
+# (6a) bidir-only: sanity check — still finite, valid mean still near 1
+w_bd, _ = compute_entropy_z_weights(
+    entropy=entropy, valid_mask=valid, advantage=advantage,
+    gid=gid_tsp, n_grp_per_inst=ngrp_tsp,
+    gamma=0.3, min_group_size=MIN_GRP, apply_perturbation=True,
+    use_bidir_norm=True, use_softmax_norm=False)
+assert torch.isfinite(w_bd).all()
+assert w_bd[:, :, :2].abs().max().item() < 1e-7
+v_mean_bd = w_bd[valid].mean().item()
+assert abs(v_mean_bd - 1.0) < 0.3
+print(f"[6a] bidir=on  softmax=off : mean(w|valid)={v_mean_bd:.3f} ✓")
+
+# (6b) softmax-only: c_t ≥ 0 strictly, and Σ_t c_t = T_valid per trajectory
+w_sm, _ = compute_entropy_z_weights(
+    entropy=entropy, valid_mask=valid, advantage=advantage,
+    gid=gid_tsp, n_grp_per_inst=ngrp_tsp,
+    gamma=0.3, min_group_size=MIN_GRP, apply_perturbation=True,
+    use_bidir_norm=False, use_softmax_norm=True)
+assert torch.isfinite(w_sm).all()
+assert (w_sm >= 0).all(), "softmax mode must give non-negative weights"
+T_valid_per_traj = valid.float().sum(dim=2)               # (B, P)
+sum_per_traj     = w_sm.sum(dim=2)                         # (B, P)
+err = (sum_per_traj - T_valid_per_traj).abs().max().item()
+assert err < 1e-3, f"softmax conservation violated: max err={err}"
+print(f"[6b] bidir=off softmax=on  : c_t≥0 ✓  Σc_t=T_valid (max err={err:.2e}) ✓")
+
+# (6c) bidir + softmax: both invariants
+w_both, _ = compute_entropy_z_weights(
+    entropy=entropy, valid_mask=valid, advantage=advantage,
+    gid=gid_tsp, n_grp_per_inst=ngrp_tsp,
+    gamma=0.3, min_group_size=MIN_GRP, apply_perturbation=True,
+    use_bidir_norm=True, use_softmax_norm=True)
+assert (w_both >= 0).all()
+sum_both = w_both.sum(dim=2)
+err_both = (sum_both - T_valid_per_traj).abs().max().item()
+assert err_both < 1e-3
+print(f"[6c] bidir=on  softmax=on  : c_t≥0 ✓  Σc_t=T_valid (max err={err_both:.2e}) ✓")
+
+# (6d) warmup with any combination → all valid c_t == 1
+for bd in (False, True):
+    for sm in (False, True):
+        w_wm_x, _ = compute_entropy_z_weights(
+            entropy=entropy, valid_mask=valid, advantage=advantage,
+            gid=gid_tsp, n_grp_per_inst=ngrp_tsp,
+            gamma=0.3, min_group_size=MIN_GRP, apply_perturbation=False,
+            use_bidir_norm=bd, use_softmax_norm=sm)
+        assert (w_wm_x[valid] - 1.0).abs().max().item() < 1e-4, \
+            f"warmup w!=1 under bidir={bd} softmax={sm}"
+        assert w_wm_x[~valid].abs().max().item() < 1e-7
+print(f"[6d] warmup: all 4 (bidir, softmax) combos give valid w==1 ✓")
+
+
 print("\n=== ALL SMOKE TESTS PASSED ===")
