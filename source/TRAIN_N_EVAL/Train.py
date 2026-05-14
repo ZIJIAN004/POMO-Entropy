@@ -1,17 +1,27 @@
 """
 Train.py — POMO REINFORCE with optional pure group-wise entropy reweighting.
 
-Supported modes (mutually exclusive):
+Supported modes:
   • USE_ENTROPY_REWEIGHT = False : baseline POMO (no reweighting)
-  • USE_ENTROPY_REWEIGHT = True  : per-step c_t = 1 + γ · sign(A) · ΔH_t
-                                   where ΔH is within-group z-score of entropy
-                                   over (instance, n_feasible[, at_depot,
-                                   load_bin, vis_ratio_bin]).
+  • USE_ENTROPY_REWEIGHT = True  : per-step c_t reweighting where ΔH is the
+                                   within-group z-score of entropy over
+                                   (instance, n_feasible[, at_depot, load_bin,
+                                   vis_ratio_bin]).
                                    First ENTROPY_WARMUP_EPOCHS epochs run with
                                    ΔH = 0 (baseline POMO) but still log
                                    monitoring stats.
+        Ablation switches (orthogonal, 4 combinations):
+          USE_BIDIR_NORM   : subtract per-trajectory mean from entropy BEFORE
+                             the bucket z-score; addresses within-bucket
+                             heteroscedasticity caused by α_i offset.
+          USE_SOFTMAX_NORM : c_t = softmax(γ·sign(A)·ΔH, dim=step) · T_valid
+                             (guarantees c_t ≥ 0, Σ_t c_t = T_valid; small-γ
+                             Taylor expansion implicitly does an extra
+                             within-trajectory centering). Without it, the
+                             linear c_t = 1 + γ·sign(A)·ΔH is used.
 
-  • USE_ENTROPY_BONUS  : A2C-style entropy bonus (independent, can stack)
+  • USE_ENTROPY_BONUS  : A2C-style entropy bonus (independent, can stack with
+                         the reweighting path).
 
 Excluded from the group statistics & from the gradient via valid_mask:
   - forced steps  (TSP: step 0; CVRP/VRPTW: steps 0-1)

@@ -13,11 +13,20 @@ features (load, vis_ratio) split into equal-width bins.
 
 Pipeline (per call):
     1. build_group_id(...)             — problem-aware dense gid construction
-    2. group mean/std over entropy     — within-group, valid steps only
-    3. ΔH = (entropy − grp_mean) / grp_std         (small groups → ΔH = 0)
-    4. c_t = 1 + γ · sign(advantage) · ΔH_t        (warmup → c_t = 1)
-    5. invalid steps → c_t = 0
-    6. diagnostics: per-instance top3 concentration & small-group fraction
+    2. (optional, use_bidir_norm)      — subtract per-trajectory mean from H
+                                          BEFORE the bucket statistics. Removes
+                                          α_i trajectory offset which drives
+                                          within-bucket heteroscedasticity.
+    3. group mean/std over (H or H_in) — within-group, valid steps only
+    4. ΔH = (· − grp_mean) / grp_std    (small groups → ΔH = 0)
+    5. c_t form (warmup → c_t = 1 on valid, 0 on invalid in both forms):
+         use_softmax_norm=False (default):
+             c_t = 1 + γ · sign(advantage) · ΔH_t                    [linear]
+         use_softmax_norm=True:
+             c_t = softmax(γ · sign(A) · ΔH, dim=step) · T_valid     [softmax]
+             — guarantees c_t ≥ 0 and Σ_t c_t = T_valid per trajectory.
+    6. invalid steps → c_t = 0 (linear: explicitly; softmax: masked_fill+remask)
+    7. diagnostics: per-instance top3 concentration & small-group fraction
 """
 
 import torch
