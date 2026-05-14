@@ -72,7 +72,7 @@ model = Model(
 
 if args.ckpt:
     state = torch.load(os.path.join(args.ckpt, 'MODEL_state_dic.pt'),
-                       map_location=device)
+                       map_location=device, weights_only=True)
     model.load_state_dict(state)
     print(f"Loaded checkpoint: {args.ckpt}")
 else:
@@ -145,17 +145,33 @@ def two_way_anova(X, vm):
 
 @torch.no_grad()
 def diagnostics(name, pred, resid, H_ref, vm):
-    """All metrics computed in H-space (resid already in H-space)."""
-    H_valid    = H_ref[vm]
+    """All metrics computed in H-space (resid already in H-space).
+
+    R² is computed **per-instance** (each instance subtracts its own grand mean
+    when forming SS_total), then summarised two ways:
+      • r2_mean   : mean across instances (each instance weighted equally)
+      • r2_pooled : Σ_b SS_res_b / Σ_b SS_tot_b (weighted by within-instance variance)
+
+    Reasoning: ANOVA is fit per-instance, so its "explainable" denominator
+    must also be the within-instance variance. Pooling H across instances
+    inflates SS_total with inter-instance differences (different problems
+    naturally have different entropy levels), which ANOVA wasn't trying to
+    explain — that would systematically deflate R².
+    """
+    vmf = vm.float()
+
+    # ── Per-instance R² ─────────────────────────────────────────────────
+    cnt_b = vmf.sum(dim=(1, 2)).clamp(min=1.0)                          # (B,)
+    mu_b  = ((H_ref * vmf).sum(dim=(1, 2)) / cnt_b).view(-1, 1, 1)      # (B,1,1)
+    tot_ss_b   = (((H_ref - mu_b) ** 2) * vmf).sum(dim=(1, 2))          # (B,)
+    resid_ss_b = (resid ** 2).sum(dim=(1, 2))                            # (B,)
+    r2_b       = 1.0 - resid_ss_b / tot_ss_b.clamp(min=1e-12)            # (B,)
+    r2_mean    = float(r2_b.mean())
+    r2_pooled  = float(1.0 - resid_ss_b.sum() / tot_ss_b.sum().clamp(min=1e-12))
+
+    # ── Heteroscedasticity (pooled by Ĥ-quintile across instances) ──────
     pred_valid = pred[vm]
     res_valid  = resid[vm]
-
-    # R² in H-space, against grand mean of H.
-    total_ss = ((H_valid - H_valid.mean()) ** 2).sum()
-    resid_ss = (res_valid ** 2).sum()
-    r2 = 1.0 - resid_ss / total_ss.clamp(min=1e-12)
-
-    # Heteroscedasticity: residual variance per Ĥ-quintile.
     qs   = torch.tensor([0.2, 0.4, 0.6, 0.8], device=pred_valid.device)
     cuts = torch.quantile(pred_valid, qs)
     bins = torch.bucketize(pred_valid, cuts)
@@ -170,7 +186,9 @@ def diagnostics(name, pred, resid, H_ref, vm):
     ratio  = (var_per_bin[-1] / max(var_per_bin[0], 1e-12)) if len(finite) == 5 else float('nan')
 
     print(f"\n[{name}]")
-    print(f"  R²              = {float(r2):.4f}")
+    print(f"  R² per-instance:  mean={r2_mean:.4f}   pooled={r2_pooled:.4f}")
+    print(f"  R² per-instance:  min={float(r2_b.min()):.3f}  "
+          f"med={float(r2_b.median()):.3f}  max={float(r2_b.max()):.3f}")
     print(f"  resid var by Ĥ-quintile (low→high):")
     for i, v in enumerate(var_per_bin):
         print(f"    Q{i+1}: {v:.3e}")
@@ -178,12 +196,13 @@ def diagnostics(name, pred, resid, H_ref, vm):
                if (0.5 < ratio < 2.0)
                else f"{ratio:.2f} → heteroscedastic")
     print(f"  top/bottom ratio = {verdict}")
-    return float(r2), ratio
+    return r2_mean, r2_pooled, ratio
 
 
 # (1) Additive in H-space
 pred_add, resid_add = two_way_anova(H, vm)
-r2_add, ratio_add = diagnostics('Additive  (H = α + β + ε)', pred_add, resid_add, H, vm)
+r2_add_m, r2_add_p, ratio_add = diagnostics(
+    'Additive  (H = α + β + ε)', pred_add, resid_add, H, vm)
 
 # (2) Multiplicative: fit in log H, then exponentiate; residuals measured in H-space
 eps      = 1e-6
@@ -192,20 +211,22 @@ logH     = H.clamp(min=eps).log()
 pred_log, _  = two_way_anova(logH, vm)
 pred_mul     = pred_log.exp()
 resid_mul    = (H - pred_mul) * vm.float()
-r2_mul, ratio_mul = diagnostics('Multiplicative (log H = α + β + ε)',
-                                pred_mul, resid_mul, H, vm)
+r2_mul_m, r2_mul_p, ratio_mul = diagnostics(
+    'Multiplicative (log H = α + β + ε)', pred_mul, resid_mul, H, vm)
 
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
-print("\n=== Summary ===")
-print(f"  Additive       :  R²={r2_add:.4f}   het.ratio={ratio_add:.2f}")
-print(f"  Multiplicative :  R²={r2_mul:.4f}   het.ratio={ratio_mul:.2f}")
+print("\n=== Summary (per-instance R²) ===")
+print(f"  Additive       :  R²_mean={r2_add_m:.4f}  R²_pooled={r2_add_p:.4f}  "
+      f"het.ratio={ratio_add:.2f}")
+print(f"  Multiplicative :  R²_mean={r2_mul_m:.4f}  R²_pooled={r2_mul_p:.4f}  "
+      f"het.ratio={ratio_mul:.2f}")
 
 def closer_to_one(a, b):
     return 'additive' if abs(a - 1) < abs(b - 1) else 'multiplicative'
 
-print(f"\n  R² 谁更高?              {'additive' if r2_add > r2_mul else 'multiplicative'}")
-print(f"  Het. ratio 谁更接近 1?  {closer_to_one(ratio_add, ratio_mul)}")
+print(f"\n  R²_mean 谁更高?            {'additive' if r2_add_m > r2_mul_m else 'multiplicative'}")
+print(f"  Het. ratio 谁更接近 1?     {closer_to_one(ratio_add, ratio_mul)}")
 print("\n  解读:")
 print("    • R² 显著更高 + het.ratio 接近 1  → 该空间结构更对")
 print("    • 两个都低 / 都异方差              → H 含交互项，需用非参数 (rank/quantile)")
