@@ -75,10 +75,14 @@ ENTROPY_WARMUP_EPOCHS    = 10           # epochs where ΔH is forced to 0 (monit
 #                     z-score. Diagnostic-motivated: within-bucket variance is
 #                     dominated by per-trajectory entropy offset α_i; removing
 #                     it makes the z-score's homoscedasticity assumption hold.
-# USE_SOFTMAX_NORM  : c_t = softmax(γ·sign(A)·ΔH, dim=step) · T_valid
-#                     instead of c_t = 1 + γ·sign(A)·ΔH. Guarantees c_t ≥ 0
-#                     and Σ_t c_t = T_valid, and implicitly does an extra
-#                     within-trajectory centering (small-γ Taylor).
+# USE_SOFTMAX_NORM  : rw_mask = valid & sufficient_bucket & (n_feasible > 1).
+#                     rw steps  : c_t = softmax(γ·sign(A)·ΔH over rw only)·T_rw
+#                     valid non-rw (small-group / forced): c_t = 1 (baseline,
+#                                   isolated from softmax denominator)
+#                     invalid   : c_t = 0
+#                     Guarantees c_t ≥ 0 and Σ_t c_t = T_valid; matches the
+#                     linear form's c_t=1 behavior on small-group / forced
+#                     steps. Without this, linear c_t = 1 + γ·sign(A)·ΔH.
 # 4 combinations form the ablation grid. Default (False, False) = current
 # linear baseline.
 USE_BIDIR_NORM           = False

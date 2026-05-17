@@ -14,10 +14,13 @@ Supported modes:
           USE_BIDIR_NORM   : subtract per-trajectory mean from entropy BEFORE
                              the bucket z-score; addresses within-bucket
                              heteroscedasticity caused by α_i offset.
-          USE_SOFTMAX_NORM : c_t = softmax(γ·sign(A)·ΔH, dim=step) · T_valid
-                             (guarantees c_t ≥ 0, Σ_t c_t = T_valid; small-γ
-                             Taylor expansion implicitly does an extra
-                             within-trajectory centering). Without it, the
+          USE_SOFTMAX_NORM : rw_mask = valid & sufficient_bucket &
+                             (n_feasible > 1). rw steps → c_t = softmax(γ·
+                             sign(A)·ΔH over rw only) · T_rw; small-group /
+                             forced (non-rw valid) → c_t = 1 (isolated from
+                             softmax denominator); invalid → 0. Preserves
+                             Σ_t c_t = T_valid and matches the linear form
+                             on baseline-treated steps. Without it, the
                              linear c_t = 1 + γ·sign(A)·ΔH is used.
 
   • USE_ENTROPY_BONUS  : A2C-style entropy bonus (independent, can stack with
