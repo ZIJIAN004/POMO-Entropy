@@ -324,7 +324,9 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
 @torch.no_grad()
 def compute_monoseg_weights(entropy, valid_mask, advantage,
                              gamma, n_feasible=None,
-                             apply_perturbation=True):
+                             apply_perturbation=True,
+                             gid=None, n_grp_per_inst=None,
+                             min_group_size=4):
     """
     entropy:           (B, P, T) — model entropy per step
     valid_mask:        (B, P, T) bool — True = real decision step
@@ -333,19 +335,23 @@ def compute_monoseg_weights(entropy, valid_mask, advantage,
     n_feasible:        (B, P, T) — feasible action count; forced steps
                                     (n_feasible ≤ 1) excluded from rw_mask
     apply_perturbation: bool     — warmup → c_t = 1 on valid, monitor only
+    gid:               (B, P, T) long — bucket id per step, optional.
+                        When provided, the function also subtracts the
+                        bucket-mean of ΔH_local from each step's ΔH_local
+                        — "post-bucket normalization". This is the hybrid
+                        path: monoseg first gives a within-trajectory trend
+                        signal, then bucket-mean over same-state cohorts
+                        removes the "typical trend at this state class",
+                        leaving the trajectory-specific deviation.
+                        None → pure monoseg (no post-norm).
+    n_grp_per_inst:    int      — total bucket count per instance, required
+                                    when gid is given.
+    min_group_size:    int      — buckets with < min steps don't post-norm
+                                    (mean is too noisy); they keep raw ΔH_local.
 
     Returns:
         w:    (B, P, T) — invalid=0, valid-non-rw=1, rw=softmax-weighted (Σ=T_rw)
-        diag: dict {
-            'delta_H_local'      : (B, P, T) — segment-anchored Δ
-            'rw_mask'            : (B, P, T) bool
-            'rw_ratio'           : scalar
-            'n_segs_per_traj'    : scalar — mean number of monotone segments per traj
-            'seg_len_mean'       : scalar — mean monotone-run length (in steps)
-            'delta_pos_mean'     : scalar — mean ΔH_local over rising-segment steps
-            'delta_neg_mean'     : scalar — mean ΔH_local over falling-segment steps
-            'ct_top3'            : scalar — softmax c_t top-3 concentration per traj
-        }
+        diag: dict { ... + 'pb_mean_abs', 'pb_active_frac' when gid given }
     """
     B, P, T = entropy.shape
     device = entropy.device
@@ -390,6 +396,35 @@ def compute_monoseg_weights(entropy, valid_mask, advantage,
         rw_mask = valid_mask & (n_feasible > 1)
     else:
         rw_mask = valid_mask.clone()
+
+    # ── 4b. (Optional) Bucket post-normalize ΔH_local. ──────────────────────
+    # Subtract the typical ΔH_local within same-state cohort. Aggregated over
+    # rw steps only (forced steps have ΔH_local=anchor signal so they'd skew
+    # the bucket mean). Buckets with < min_group_size rw steps are left as-is.
+    pb_mean_abs = torch.tensor(0.0, device=device)
+    pb_active_frac = torch.tensor(0.0, device=device)
+    if gid is not None and n_grp_per_inst is not None:
+        gid_flat = gid.reshape(-1)
+        bid = torch.arange(B, device=device).repeat_interleave(P * T)
+        gid_global = bid * n_grp_per_inst + gid_flat
+        n_grp_total = B * n_grp_per_inst
+
+        rwm_flat = rw_mask.reshape(-1).float()
+        dH_flat  = delta_H_local.reshape(-1)
+        counts = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, rwm_flat)
+        sums   = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, dH_flat * rwm_flat)
+        bucket_mean = sums / counts.clamp(min=1)
+
+        sufficient = (counts >= float(min_group_size))
+        suff_step = sufficient[gid_global].view(B, P, T)
+        bucket_mean_step = bucket_mean[gid_global].view(B, P, T)
+        post_adjust = torch.where(suff_step,
+                                   bucket_mean_step,
+                                   torch.zeros_like(bucket_mean_step))
+        delta_H_local = delta_H_local - post_adjust
+
+        pb_mean_abs = (post_adjust.abs() * rw_mask.float()).sum() / rw_mask.float().sum().clamp(min=1.0)
+        pb_active_frac = (suff_step & rw_mask).float().sum() / rw_mask.float().sum().clamp(min=1.0)
 
     # ── 5. softmax c_t over trajectory (rw subset). ─────────────────────────
     sign_A = advantage.sign().unsqueeze(2)                        # (B, P, 1)
@@ -436,5 +471,7 @@ def compute_monoseg_weights(entropy, valid_mask, advantage,
         'delta_pos_mean':  delta_pos_mean.detach(),
         'delta_neg_mean':  delta_neg_mean.detach(),
         'ct_top3':         ct_top3.detach(),
+        'pb_mean_abs':     pb_mean_abs.detach(),
+        'pb_active_frac':  pb_active_frac.detach(),
     }
     return w, diag

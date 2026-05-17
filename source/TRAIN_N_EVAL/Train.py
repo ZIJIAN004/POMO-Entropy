@@ -81,6 +81,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     dPos_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on rising-seg steps
     dNeg_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on falling-seg steps
     ctTop3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # softmax c_t top-3 concentration
+    pbAbs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: |bucket_mean ΔH|
+    pbAct_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: fraction of rw with sufficient bucket
 
     logger_start = time.time()
     episode      = 0
@@ -176,7 +178,33 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             valid   = _make_valid_mask(T_total, batch_size, device, finished_list)
 
             if USE_MONOSEG_BASELINE:
-                # Trajectory-internal monotonic-segment baseline. No bucketing.
+                # Trajectory-internal monotonic-segment baseline.
+                # Optional post-bucket norm: 3-dim bucket (no vis_ratio).
+                gid_arg, n_grp_arg = None, None
+                if USE_MONOSEG_POSTBUCKET:
+                    if PROBLEM_TYPE == 'tsp':
+                        gid_arg, n_grp_arg = build_group_id(
+                            'tsp', n_feasible=n_feasible_list,
+                            n_bins=ENTROPY_N_BINS)
+                    elif PROBLEM_TYPE == 'cvrp':
+                        gid_arg, n_grp_arg = build_group_id(
+                            'cvrp',
+                            n_feasible=n_feasible_list,
+                            at_depot=at_depot_list,
+                            load=load_list,
+                            vis_ratio=None,          # postbucket forces 3-dim
+                            n_bins=ENTROPY_N_BINS,
+                        )
+                    else:  # vrptw
+                        gid_arg, n_grp_arg = build_group_id(
+                            'vrptw',
+                            n_feasible=n_feasible_list,
+                            at_depot=at_depot_list,
+                            time=time_list,
+                            vis_ratio=None,
+                            n_bins=ENTROPY_N_BINS,
+                        )
+
                 weights, diag = compute_monoseg_weights(
                     entropy=entropy_list,
                     valid_mask=valid,
@@ -184,6 +212,9 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     gamma=ENTROPY_GAMMA,
                     n_feasible=n_feasible_list,
                     apply_perturbation=apply_pert,
+                    gid=gid_arg,
+                    n_grp_per_inst=n_grp_arg,
+                    min_group_size=ENTROPY_MIN_GROUP_SIZE,
                 )
                 log_prob = (prob_list.log() * weights).sum(dim=2)
 
@@ -199,6 +230,9 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     dNeg_AM.push(diag['delta_neg_mean'].unsqueeze(0))
                 if ctTop3_AM is not None:
                     ctTop3_AM.push(diag['ct_top3'].unsqueeze(0))
+                if USE_MONOSEG_POSTBUCKET and pbAbs_AM is not None:
+                    pbAbs_AM.push(diag['pb_mean_abs'].unsqueeze(0))
+                    pbAct_AM.push(diag['pb_active_frac'].unsqueeze(0))
 
                 with torch.no_grad():
                     A_snr = (advantage.abs() /
@@ -322,6 +356,9 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     dNeg_AM.result() if dNeg_AM.count > 0 else float('nan'),
                     ctTop3_AM.result() if ctTop3_AM.count > 0 else float('nan'),
                     asnr_AM.result() if asnr_AM.count > 0 else float('nan'))
+                if USE_MONOSEG_POSTBUCKET and pbAbs_AM is not None and pbAbs_AM.count > 0:
+                    extra += "  PB: |Δ̄|={:.3f}  act={:.2f}".format(
+                        pbAbs_AM.result(), pbAct_AM.result())
             elif top3_AM is not None and top3_AM.count > 0:
                 # Bucket-mode log (unchanged).
                 extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f} R²={:.3f}".format(

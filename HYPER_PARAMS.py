@@ -113,6 +113,13 @@ LOW_GRP_MEAN_THRESH      = 0.0
 # implicit-True (monoseg always uses softmax).
 USE_MONOSEG_BASELINE     = False
 
+# When USE_MONOSEG_BASELINE=True, additionally bucket-normalize ΔH_local by
+# state class: subtract the cohort-average ΔH_local from each step's
+# ΔH_local. Bucket is always 3-dim (n_feasible, at_depot, load/time_bin) —
+# no vis_ratio. Leaves only the trajectory-specific deviation from the
+# typical "anchor→t" trend at that state class.
+USE_MONOSEG_POSTBUCKET   = False
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)

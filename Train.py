@@ -39,6 +39,9 @@ _parser.add_argument('--lowg-thresh', type=float, default=None,
 _parser.add_argument('--monoseg', type=str, default=None, choices=['on', 'off'],
                      help='use monotonic-segment baseline instead of bucket: '
                           'ΔH_t = H_t − H[last_reversal_t], softmax over trajectory.')
+_parser.add_argument('--postbucket', type=str, default=None, choices=['on', 'off'],
+                     help='only with --monoseg on: subtract bucket-mean of '
+                          'ΔH_local within (n_feasible, at_depot, load_bin).')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -65,6 +68,8 @@ if _args.lowg_thresh is not None:
     _HP.LOW_GRP_MEAN_THRESH = _args.lowg_thresh
 if _args.monoseg is not None:
     _HP.USE_MONOSEG_BASELINE = (_args.monoseg == 'on')
+if _args.postbucket is not None:
+    _HP.USE_MONOSEG_POSTBUCKET = (_args.postbucket == 'on')
 
 from HYPER_PARAMS import *
 
@@ -73,6 +78,8 @@ if USE_ENTROPY_REWEIGHT:
     _tag += "-Z_g{}_w{}".format(ENTROPY_GAMMA, ENTROPY_WARMUP_EPOCHS)
     if USE_MONOSEG_BASELINE:
         _tag += "-Mseg"
+        if USE_MONOSEG_POSTBUCKET:
+            _tag += "-PB"
     else:
         if USE_BIDIR_NORM:
             _tag += "-Bd"
