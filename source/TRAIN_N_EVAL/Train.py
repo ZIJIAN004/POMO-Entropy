@@ -40,23 +40,6 @@ from HYPER_PARAMS import *
 from source.utilities import Average_Meter
 from source.baseline import build_group_id, compute_entropy_z_weights
 
-# Lazy import: only pull in SVD bridge when enabled (cross-project import,
-# fails loudly if SVD-Reward isn't on the path).
-if USE_SVD_REWARD:
-    from source.svd_advantage import (
-        load_ae, encode_rollouts_to_z, compute_hybrid_advantage)
-
-# Module-level AE cache: load once per (ckpt_path, device) and reuse across
-# all epochs/batches of a training run.
-_AE_CACHE = {}
-
-
-def _get_ae(ckpt_path, device):
-    key = (ckpt_path, str(device))
-    if key not in _AE_CACHE:
-        _AE_CACHE[key] = load_ae(ckpt_path, device)
-    return _AE_CACHE[key]
-
 
 def _make_valid_mask(T_total, batch_size, device, finished_list=None):
     """forced-steps + finished padding → invalid; rest valid."""
@@ -79,14 +62,10 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     rw_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None
-    svd_AM   = Average_Meter() if USE_SVD_REWARD else None
 
     logger_start = time.time()
     episode      = 0
     device       = next(model.parameters()).device
-
-    # Load AE once per training run (cached across epochs).
-    _ae = _get_ae(SVD_CKPT_PATH, device) if USE_SVD_REWARD else None
 
     # True once warmup is done — apply the actual perturbation. During warmup
     # we still compute group stats (for monitoring) but force ΔH = 0.
@@ -159,27 +138,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
 
         # ── REINFORCE advantage ──────────────────────────────────────────
         reward_f  = reward.float()
-        if USE_SVD_REWARD:
-            # GPU-batched encode of all B·P rollouts → hybrid advantage.
-            if PROBLEM_TYPE != 'tsp':
-                raise NotImplementedError(
-                    "SVD-Reward currently supports TSP only "
-                    "(needs Hamilton-cycle tour representation).")
-            z = encode_rollouts_to_z(
-                ae=_ae,
-                node_xy=env.node_xy,
-                selected_list=env.selected_node_list,
-                knn_k=SVD_KNN_K,
-            )                                                # (B, P, D)
-            advantage, svd_diag = compute_hybrid_advantage(
-                z=z, rewards=reward_f,
-                alpha=SVD_ALPHA, rank=SVD_RANK, top_k=SVD_TOP_K,
-                return_diag=True,
-            )                                                # (B, P)
-            if svd_AM is not None:
-                svd_AM.push(svd_diag['cost_svd_corr'].unsqueeze(0))
-        else:
-            advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
+        advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
 
         # ── Compute weighted log_prob ────────────────────────────────────
         if USE_ENTROPY_REWEIGHT:
@@ -244,9 +203,6 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 phase = "warmup" if not apply_pert else "active"
                 extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f}".format(
                     phase, top3_AM.result(), small_AM.result(), rw_AM.result())
-            if svd_AM is not None and svd_AM.count > 0:
-                extra += "  SVD(α={}):cost_corr={:+.3f}".format(
-                    SVD_ALPHA, svd_AM.result())
             logger.info('Ep:{:03d}-{:07d}({:5.1f}%)  T:{}  Loss:{:+.4f}  Avg.best_dist:{:.4f}{}'.format(
                 epoch, episode, 100. * episode / TRAIN_EPISODES,
                 elapsed, loss_AM.result(), score_AM.result(), extra))
