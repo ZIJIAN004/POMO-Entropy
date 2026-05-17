@@ -30,11 +30,13 @@ notify "POMO-Entropy VRPTW 启动" \
 problem=vrptw  size=100  softmax=on  epoch=200
 log: logs/vrptw_${JOB}.log"
 
-# ── 训练：vrptw100, softmax-norm reweight, 200 epoch ─────────────────────────
+# ── 训练：vrptw100, softmax + 3-dim bin (no vis_ratio) + lowg mask, 200 ep ──
 python -u Train.py \
     --problem vrptw \
     --size 100 \
     --softmax on \
+    --vis-ratio off \
+    --lowg-thresh 0.05 \
     --epoch 200
 
 EXIT=$?
