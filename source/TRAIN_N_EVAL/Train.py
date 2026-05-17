@@ -62,6 +62,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     rw_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None
+    r2_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None   # bucket R² — partition quality
     # H1 diagnostic: corr(ΔH, A) on rw steps, partitioned by GROUP grp_mean.
     # Reweighting operates per-group (grp_mean/grp_std shared by all steps in
     # a bucket), so the right partitioning unit is the group, not the step.
@@ -212,6 +213,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 small_AM.push(diag['small_group_ratio'].unsqueeze(0))
             if rw_AM is not None:
                 rw_AM.push(diag['rw_ratio'].unsqueeze(0))
+            if r2_AM is not None:
+                r2_AM.push(diag['r2_grp'].unsqueeze(0))
 
             # ── H1 diagnostic (TSP-vs-CVRP comparison) ─────────────────────
             # Partition rw steps by their GROUP's grp_mean (median split).
@@ -273,8 +276,9 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             extra = ""
             if top3_AM is not None and top3_AM.count > 0:
                 phase = "warmup" if not apply_pert else "active"
-                extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f}".format(
-                    phase, top3_AM.result(), small_AM.result(), rw_AM.result())
+                extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f} R²={:.3f}".format(
+                    phase, top3_AM.result(), small_AM.result(), rw_AM.result(),
+                    r2_AM.result() if r2_AM.count > 0 else float('nan'))
                 # H1 diagnostic readout (group-level partition)
                 if corrH_AM is not None and corrH_AM.count > 0:
                     cH = corrH_AM.result()

@@ -263,10 +263,29 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
     valid_per_inst = vmf.sum(dim=(1, 2)).clamp(min=1.0)               # (B,)
     rw_ratio = (rw_per_inst / valid_per_inst).mean()
 
+    # R²_grp: per-instance share of H_in variance explained by the bucket grouping.
+    # R² = 1 − within_ss / total_ss, where:
+    #   within_ss = Σ_g Σ_{i∈g} (H_in_i − grp_mean_g)²    (= sq_sums.sum())
+    #   total_ss  = Σ_i (H_in_i − global_mean_i)²
+    # Tells whether the partition is actually homogenizing entropy:
+    #   ≈ 0  : buckets are no better than random — partition wrong
+    #   .3–.5: bucket explains main variation, residual noise (healthy)
+    #   .6–.8: very clean buckets
+    #   ≈ 1  : likely over-fit (each bucket has 1 step)
+    H_sq_per_inst  = (H_in * H_in * vmf).sum(dim=(1, 2))              # (B,)
+    H_sum_per_inst = (H_in * vmf).sum(dim=(1, 2))                     # (B,)
+    n_per_inst     = vmf.sum(dim=(1, 2)).clamp(min=1.0)               # (B,)
+    total_ss_per_inst  = (H_sq_per_inst
+                          - H_sum_per_inst.square() / n_per_inst)     # (B,)
+    within_ss_per_inst = sq_sums.reshape(B, n_grp_per_inst).sum(dim=1) # (B,)
+    r2_per_inst = 1.0 - within_ss_per_inst / total_ss_per_inst.clamp(min=1e-8)
+    r2_grp = r2_per_inst.clamp(min=0.0, max=1.0).mean()
+
     diag = {
         'top3_concentration': top3_concentration.detach(),
         'small_group_ratio':  small_group_ratio.detach(),
         'rw_ratio':           rw_ratio.detach(),
+        'r2_grp':             r2_grp.detach(),                            # bucket-variance-explained
         'delta_H':            delta_H.detach(),                          # (B, P, T)
         'rw_mask':            rw_mask.detach(),                          # (B, P, T) bool
         'grp_mean':           grp_mean.view(B, P, T).detach(),           # bucket mean of H_in,
