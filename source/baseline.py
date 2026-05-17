@@ -235,5 +235,7 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
         'top3_concentration': top3_concentration.detach(),
         'small_group_ratio':  small_group_ratio.detach(),
         'rw_ratio':           rw_ratio.detach(),
+        'delta_H':            delta_H.detach(),       # (B, P, T) — exposed for H1 diagnostic
+        'rw_mask':            rw_mask.detach(),       # (B, P, T) bool
     }
     return w, diag
