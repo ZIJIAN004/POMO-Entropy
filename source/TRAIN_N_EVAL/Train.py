@@ -166,6 +166,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             T_total = prob_list.size(2)
             valid   = _make_valid_mask(T_total, batch_size, device, finished_list)
 
+            # USE_VIS_RATIO_BIN=False → 3-dim bucket (drop vis_ratio).
+            vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
             if PROBLEM_TYPE == 'tsp':
                 gid, n_grp = build_group_id(
                     'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
@@ -175,7 +177,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     n_feasible=n_feasible_list,
                     at_depot=at_depot_list,
                     load=load_list,
-                    vis_ratio=vis_ratio_list,
+                    vis_ratio=vis_arg,
                     n_bins=ENTROPY_N_BINS,
                 )
             else:  # vrptw
@@ -184,7 +186,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     n_feasible=n_feasible_list,
                     at_depot=at_depot_list,
                     time=time_list,
-                    vis_ratio=vis_ratio_list,
+                    vis_ratio=vis_arg,
                     n_bins=ENTROPY_N_BINS,
                 )
 
@@ -200,6 +202,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 use_bidir_norm=USE_BIDIR_NORM,
                 use_softmax_norm=USE_SOFTMAX_NORM,
                 n_feasible=n_feasible_list,
+                low_grp_mean_thresh=LOW_GRP_MEAN_THRESH,
             )
             log_prob = (prob_list.log() * weights).sum(dim=2)
 

@@ -30,6 +30,12 @@ _parser.add_argument('--bidir', type=str, default=None, choices=['on', 'off'],
 _parser.add_argument('--softmax', type=str, default=None, choices=['on', 'off'],
                      help='softmax c_t = softmax(γ·sign(A)·ΔH, dim=step)·T_valid '
                           'instead of linear c_t = 1+γ·sign(A)·ΔH.')
+_parser.add_argument('--vis-ratio', type=str, default=None, choices=['on', 'off'],
+                     help='include vis_ratio as a binning dim on CVRP/VRPTW. '
+                          'off → 3-dim bucket (n_feasible, at_depot, load/time).')
+_parser.add_argument('--lowg-thresh', type=float, default=None,
+                     help='strip rw eligibility from buckets with grp_mean < '
+                          'this threshold. 0 = no filter; 0.05 ≈ "low-entropy mask".')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -50,6 +56,10 @@ if _args.bidir is not None:
     _HP.USE_BIDIR_NORM = (_args.bidir == 'on')
 if _args.softmax is not None:
     _HP.USE_SOFTMAX_NORM = (_args.softmax == 'on')
+if _args.vis_ratio is not None:
+    _HP.USE_VIS_RATIO_BIN = (_args.vis_ratio == 'on')
+if _args.lowg_thresh is not None:
+    _HP.LOW_GRP_MEAN_THRESH = _args.lowg_thresh
 
 from HYPER_PARAMS import *
 
@@ -60,6 +70,10 @@ if USE_ENTROPY_REWEIGHT:
         _tag += "-Bd"
     if USE_SOFTMAX_NORM:
         _tag += "-Sm"
+    if PROBLEM_TYPE in ('cvrp', 'vrptw') and not USE_VIS_RATIO_BIN:
+        _tag += "-noVR"
+    if LOW_GRP_MEAN_THRESH > 0.0:
+        _tag += "-Lm{}".format(LOW_GRP_MEAN_THRESH)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)

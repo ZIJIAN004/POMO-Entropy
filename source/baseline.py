@@ -51,15 +51,16 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
     """Construct per-instance dense group id.
 
     TSP  : gid = n_feasible                              (1 discrete dim)
-    CVRP : gid = n_feasible · S₁ + at_depot · S₂
-                 + load_bin · n_bins + vis_ratio_bin     (1 disc + 1 bin + 1 disc + 1 bin)
-           where S₂ = n_bins², S₁ = 2 · S₂.
-    VRPTW: same 4-dim structure as CVRP but with the normalized current_time
-           replacing load (load doesn't exist on VRPTW; current_time is the
-           per-route progress signal that drives the time-window constraint).
+    CVRP : with vis_ratio (4-dim):
+             gid = n_feasible · S₁ + at_depot · S₂
+                   + load_bin · n_bins + vis_ratio_bin
+             where S₂ = n_bins², S₁ = 2 · S₂.
+           without vis_ratio (3-dim, vis_ratio=None):
+             gid = n_feasible · (2 · n_bins) + at_depot · n_bins + load_bin
+             → ~n_bins× fewer slots, larger buckets, more stable grp_std.
+    VRPTW: same as CVRP but with normalized current_time replacing load.
            Caller must pre-normalize time into [0, 1] (e.g. current_time /
-           tw_end_max). Resets at depot are fine — at_depot dimension absorbs
-           that.
+           tw_end_max). Resets at depot are fine — at_depot absorbs that.
 
     Continuous features are clamped into [0, 1] before binning (handles
     invalid/forced-step garbage values without crashing — they're masked
@@ -72,20 +73,25 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 
     if problem_type in ('cvrp', 'vrptw'):
         if problem_type == 'cvrp':
-            assert at_depot is not None and load is not None and vis_ratio is not None, (
-                "cvrp requires at_depot/load/vis_ratio for group construction")
+            assert at_depot is not None and load is not None, (
+                "cvrp requires at_depot/load for group construction")
             cont = load
         else:
-            assert at_depot is not None and time is not None and vis_ratio is not None, (
-                "vrptw requires at_depot/time/vis_ratio for group construction")
+            assert at_depot is not None and time is not None, (
+                "vrptw requires at_depot/time for group construction")
             cont = time
         ad = at_depot.long()                            # (B, P, T) in {0,1}
         cb = (cont.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
-        vb = (vis_ratio.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
         max_nf = int(nf.max().item()) + 1
-        S2 = n_bins * n_bins                            # stride for at_depot
-        S1 = 2 * S2                                     # stride for n_feasible
-        gid = nf * S1 + ad * S2 + cb * n_bins + vb
+        if vis_ratio is not None:
+            vb = (vis_ratio.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
+            S2 = n_bins * n_bins                        # stride for at_depot
+            S1 = 2 * S2                                 # stride for n_feasible
+            gid = nf * S1 + ad * S2 + cb * n_bins + vb
+            return gid, max_nf * S1
+        # 3-dim variant: drop vis_ratio dimension entirely.
+        S1 = 2 * n_bins                                 # stride for n_feasible
+        gid = nf * S1 + ad * n_bins + cb
         return gid, max_nf * S1
 
     raise ValueError(f"Unknown problem_type: {problem_type}")
@@ -99,7 +105,7 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_inst,
                                gamma, min_group_size=4, apply_perturbation=True,
                                use_bidir_norm=False, use_softmax_norm=False,
-                               n_feasible=None):
+                               n_feasible=None, low_grp_mean_thresh=0.0):
     """
     entropy:           (B, P, T) — model entropy at each step
     valid_mask:        (B, P, T) bool — True = real decision step
@@ -126,6 +132,14 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
                                     when use_softmax_norm=True (used to mark
                                     deterministic steps as non-reweight);
                                     ignored otherwise.
+    low_grp_mean_thresh: float    — buckets whose grp_mean < this are stripped
+                                     from rw_mask (set to baseline c_t=1 under
+                                     softmax, c_t=1+0=1 under linear since their
+                                     ΔH is left untouched in the perturbation
+                                     branch but they're held outside rw). 0.0
+                                     disables the filter. Use ~0.05 to drop
+                                     near-deterministic buckets where ΔH is
+                                     essentially noise.
 
     Returns:
         w:    (B, P, T) — c_t. invalid step = 0; small-group step = 1
@@ -195,6 +209,19 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
         rw_mask = valid_mask & suff_step & (n_feasible > 1)          # (B, P, T) bool
     else:
         rw_mask = valid_mask & suff_step
+
+    # Low-entropy bucket filter: buckets whose grp_mean is below the threshold
+    # carry essentially noise in ΔH (near-deterministic policy). Strip them
+    # from rw_mask → softmax: c_t=1; linear: ΔH still = z(noise) but since the
+    # caller can drive ΔH→0 by combining with sufficient_per_step downstream,
+    # we just zero ΔH on the dropped steps too for safety.
+    if low_grp_mean_thresh > 0.0:
+        grp_mean_step = grp_mean.view(B, P, T)
+        keep_grp = grp_mean_step > float(low_grp_mean_thresh)         # (B, P, T)
+        rw_mask = rw_mask & keep_grp
+        # Zero ΔH on the filtered-out steps so the linear branch also leaves
+        # them at c_t = 1 + γ·sign(A)·0 = 1.
+        delta_H = delta_H * keep_grp.float()
 
     # ── c_t: linear (1+γ·sign(A)·ΔH) or isolated softmax over rw subset ──────
     sign_A = advantage.sign().unsqueeze(2)                           # (B, P, 1)

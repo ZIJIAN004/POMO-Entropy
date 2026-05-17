@@ -88,6 +88,19 @@ ENTROPY_WARMUP_EPOCHS    = 10           # epochs where ΔH is forced to 0 (monit
 USE_BIDIR_NORM           = False
 USE_SOFTMAX_NORM         = False
 
+# ── Group-construction / filter ablations ───────────────────────────────────
+# USE_VIS_RATIO_BIN    : include vis_ratio as a binning dimension on CVRP/VRPTW.
+#                        Off → bucket = (n_feasible, at_depot, load/time_bin),
+#                        3 dims instead of 4 → fewer slots, more steps per bucket,
+#                        more stable grp_std. Diagnostic motivation: top3=0.022
+#                        observed under 4 dims means avg bucket is tiny.
+# LOW_GRP_MEAN_THRESH  : drop rw eligibility from buckets whose grp_mean <
+#                        this threshold. 0 = no filter. ~0.05 strips ≈8% of rw
+#                        steps that live in near-deterministic buckets where
+#                        ΔH ≈ noise (lowG(<.05) diagnostic).
+USE_VIS_RATIO_BIN        = True
+LOW_GRP_MEAN_THRESH      = 0.0
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)
