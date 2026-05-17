@@ -165,6 +165,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 apply_perturbation=apply_pert,
                 use_bidir_norm=USE_BIDIR_NORM,
                 use_softmax_norm=USE_SOFTMAX_NORM,
+                n_feasible=n_feasible_list,
             )
             log_prob = (prob_list.log() * weights).sum(dim=2)
 

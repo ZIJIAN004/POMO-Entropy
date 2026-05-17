@@ -22,10 +22,17 @@ Pipeline (per call):
     5. c_t form (warmup → c_t = 1 on valid, 0 on invalid in both forms):
          use_softmax_norm=False (default):
              c_t = 1 + γ · sign(advantage) · ΔH_t                    [linear]
+             — small-group (ΔH=0) and forced (n_feasible≤1, all H=0 in bucket
+               → ΔH=0) steps automatically get c_t = 1.
          use_softmax_norm=True:
-             c_t = softmax(γ · sign(A) · ΔH, dim=step) · T_valid     [softmax]
-             — guarantees c_t ≥ 0 and Σ_t c_t = T_valid per trajectory.
-    6. invalid steps → c_t = 0 (linear: explicitly; softmax: masked_fill+remask)
+             rw_mask = valid & sufficient_bucket & (n_feasible > 1)
+             — rw  steps: c_t = softmax(γ·sign(A)·ΔH over rw only) · T_rw
+             — valid but not rw (small-group / forced): c_t = 1 (baseline)
+             — invalid: c_t = 0
+             — Isolates non-reweight steps from the softmax denominator so
+               they neither influence nor are influenced by reweighted steps.
+               Σ_t c_t = T_rw + (T_valid − T_rw) = T_valid preserved.
+    6. invalid steps → c_t = 0 (linear: explicitly; softmax: torch.where)
     7. diagnostics: per-instance top3 concentration & small-group fraction
 """
 
@@ -86,7 +93,8 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 @torch.no_grad()
 def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_inst,
                                gamma, min_group_size=4, apply_perturbation=True,
-                               use_bidir_norm=False, use_softmax_norm=False):
+                               use_bidir_norm=False, use_softmax_norm=False,
+                               n_feasible=None):
     """
     entropy:           (B, P, T) — model entropy at each step
     valid_mask:        (B, P, T) bool — True = real decision step
@@ -101,10 +109,18 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
                                     entropy BEFORE the (instance, gid) z-score.
                                     Removes the α_i trajectory offset that
                                     drives within-bucket heteroscedasticity.
-    use_softmax_norm:  bool      — if True, c_t = softmax(γ·sign(A)·ΔH, dim=2)
-                                    · T_valid (guarantees c_t ≥ 0 and Σ_t c_t
-                                    = T_valid; also implicitly within-trajectory
-                                    centers ΔH). If False, linear c_t = 1+γ·…
+    use_softmax_norm:  bool      — if True, isolate small-group and forced
+                                    (n_feasible≤1) steps from softmax: those
+                                    keep c_t=1, only reweight-eligible steps
+                                    enter softmax(γ·sign(A)·ΔH) · T_rw.
+                                    Preserves c_t≥0, Σ_t c_t = T_valid, and
+                                    matches the linear form's baseline behavior
+                                    on non-reweight steps. If False, linear
+                                    c_t = 1+γ·…
+    n_feasible:        (B, P, T) — feasible action count per step. Required
+                                    when use_softmax_norm=True (used to mark
+                                    deterministic steps as non-reweight);
+                                    ignored otherwise.
 
     Returns:
         w:    (B, P, T) — c_t. invalid step = 0; small-group step = 1
@@ -164,15 +180,27 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
         delta_H = torch.zeros_like(delta_H)
 
     delta_H = delta_H.reshape(B, P, T)
+    suff_step = sufficient_per_step.view(B, P, T).bool()             # (B, P, T)
 
-    # ── c_t: linear (1+γ·sign(A)·ΔH) or softmax(γ·sign(A)·ΔH)·T_valid ────────
+    # ── c_t: linear (1+γ·sign(A)·ΔH) or isolated softmax over rw subset ──────
     sign_A = advantage.sign().unsqueeze(2)                           # (B, P, 1)
     if use_softmax_norm:
-        logit   = gamma * sign_A * delta_H                           # (B, P, T)
-        logit   = logit.masked_fill(~valid_mask, -1e9)               # invalid → ≈0 after softmax
-        T_valid = vmf.sum(dim=2, keepdim=True).clamp(min=1.0)
-        w       = torch.softmax(logit, dim=2) * T_valid
-        w       = w * vmf                                             # invalid → 0 explicitly
+        assert n_feasible is not None, (
+            "use_softmax_norm=True requires n_feasible (B,P,T) to identify "
+            "forced (n_feasible≤1) steps that must stay at c_t=1.")
+
+        # Reweight-eligible: valid AND in a sufficient bucket AND not forced.
+        # Small-group (suff_step=False) and forced (n_feasible≤1) steps are
+        # held at c_t=1 — isolated from the softmax denominator so they
+        # neither dilute the redistribution nor get diluted by it.
+        rw_mask = valid_mask & suff_step & (n_feasible > 1)          # (B, P, T) bool
+
+        logit = (gamma * sign_A * delta_H).masked_fill(~rw_mask, -1e9)
+        T_rw  = rw_mask.float().sum(dim=2, keepdim=True).clamp(min=1.0)
+        w_rw  = torch.softmax(logit, dim=2) * T_rw                    # softmax over rw only
+
+        # Compose: invalid → 0; valid & not rw → 1; rw → softmax weight.
+        w = torch.where(rw_mask, w_rw, vmf)
     else:
         w = 1.0 + gamma * sign_A * delta_H                            # (B, P, T)
         w = w * vmf                                                    # invalid → 0
