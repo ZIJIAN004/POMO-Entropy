@@ -18,6 +18,8 @@ _parser.add_argument('--size', type=int, default=None)
 _parser.add_argument('--mode', type=str, default=None,
                      choices=['off', 'on'],
                      help='off: baseline POMO; on: enable entropy reweighting.')
+_parser.add_argument('--epoch', type=int, default=None,
+                     help='override TOTAL_EPOCH.')
 _parser.add_argument('--warmup', type=int, default=None,
                      help='Epochs to delay perturbation (only monitoring during warmup).')
 _parser.add_argument('--gamma', type=float, default=None,
@@ -38,6 +40,8 @@ if _args.size is not None:
     _HP.POMO_SIZE    = _args.size
 if _args.mode is not None:
     _HP.USE_ENTROPY_REWEIGHT = (_args.mode == 'on')
+if _args.epoch is not None:
+    _HP.TOTAL_EPOCH = _args.epoch
 if _args.warmup is not None:
     _HP.ENTROPY_WARMUP_EPOCHS = _args.warmup
 if _args.gamma is not None:

@@ -1,0 +1,12 @@
+# POMO-Entropy minimal runtime dependencies
+#
+# PyTorch is intentionally NOT listed here — install it via conda so the
+# CUDA toolkit matches the cluster. See README / setup instructions:
+#   conda install -c pytorch -c nvidia pytorch pytorch-cuda=12.1
+# (adjust pytorch-cuda to match the cluster's CUDA driver)
+#
+# Everything below is pure-python and safe via pip.
+
+numpy>=1.21
+matplotlib>=3.5
+pytz>=2022.1

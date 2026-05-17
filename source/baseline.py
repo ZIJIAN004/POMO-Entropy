@@ -8,8 +8,9 @@ We want to extract pure model_confidence by subtracting the environment effect,
 which we estimate as the group mean of entropy over "same-environment" steps.
 
 "Same environment" is defined as same (instance, n_feasible[, at_depot,
-load_bin, vis_ratio_bin]) — discrete features used directly, continuous
-features (load, vis_ratio) split into equal-width bins.
+load_bin/time_bin, vis_ratio_bin]) — discrete features used directly, continuous
+features (load on CVRP, normalized current_time on VRPTW, vis_ratio) split into
+equal-width bins.
 
 Pipeline (per call):
     1. build_group_id(...)             — problem-aware dense gid construction
@@ -46,13 +47,19 @@ import torch
 # ---------------------------------------------------------------------------
 
 def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
-                   vis_ratio=None, n_bins=10):
+                   time=None, vis_ratio=None, n_bins=10):
     """Construct per-instance dense group id.
 
-    TSP : gid = n_feasible                              (1 discrete dim)
-    CVRP: gid = n_feasible · S₁ + at_depot · S₂
-                + load_bin · n_bins + vis_ratio_bin     (1 disc + 1 bin + 1 disc + 1 bin)
-          where S₂ = n_bins², S₁ = 2 · S₂.
+    TSP  : gid = n_feasible                              (1 discrete dim)
+    CVRP : gid = n_feasible · S₁ + at_depot · S₂
+                 + load_bin · n_bins + vis_ratio_bin     (1 disc + 1 bin + 1 disc + 1 bin)
+           where S₂ = n_bins², S₁ = 2 · S₂.
+    VRPTW: same 4-dim structure as CVRP but with the normalized current_time
+           replacing load (load doesn't exist on VRPTW; current_time is the
+           per-route progress signal that drives the time-window constraint).
+           Caller must pre-normalize time into [0, 1] (e.g. current_time /
+           tw_end_max). Resets at depot are fine — at_depot dimension absorbs
+           that.
 
     Continuous features are clamped into [0, 1] before binning (handles
     invalid/forced-step garbage values without crashing — they're masked
@@ -63,25 +70,23 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
     if problem_type == 'tsp':
         return nf, int(nf.max().item()) + 1
 
-    if problem_type == 'cvrp':
-        assert at_depot is not None and load is not None and vis_ratio is not None, (
-            "cvrp requires at_depot/load/vis_ratio for group construction")
+    if problem_type in ('cvrp', 'vrptw'):
+        if problem_type == 'cvrp':
+            assert at_depot is not None and load is not None and vis_ratio is not None, (
+                "cvrp requires at_depot/load/vis_ratio for group construction")
+            cont = load
+        else:
+            assert at_depot is not None and time is not None and vis_ratio is not None, (
+                "vrptw requires at_depot/time/vis_ratio for group construction")
+            cont = time
         ad = at_depot.long()                            # (B, P, T) in {0,1}
-        lb = (load.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
+        cb = (cont.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
         vb = (vis_ratio.clamp(0.0, 1.0) * n_bins).long().clamp(max=n_bins - 1)
         max_nf = int(nf.max().item()) + 1
         S2 = n_bins * n_bins                            # stride for at_depot
         S1 = 2 * S2                                     # stride for n_feasible
-        gid = nf * S1 + ad * S2 + lb * n_bins + vb
+        gid = nf * S1 + ad * S2 + cb * n_bins + vb
         return gid, max_nf * S1
-
-    if problem_type == 'vrptw':
-        # VRPTW: continuous features (current_time) are unnormalized; defer
-        # proper handling. Reweighting on VRPTW is intentionally not supported
-        # yet — caller must keep USE_ENTROPY_REWEIGHT off for vrptw.
-        raise NotImplementedError(
-            "entropy reweighting not yet supported for VRPTW — "
-            "set USE_ENTROPY_REWEIGHT = False for this problem.")
 
     raise ValueError(f"Unknown problem_type: {problem_type}")
 

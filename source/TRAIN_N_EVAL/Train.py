@@ -81,14 +81,11 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     # we still compute group stats (for monitoring) but force ΔH = 0.
     apply_pert = USE_ENTROPY_REWEIGHT and (epoch > ENTROPY_WARMUP_EPOCHS)
 
-    if USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'vrptw':
-        raise NotImplementedError(
-            "USE_ENTROPY_REWEIGHT is not supported for vrptw yet; "
-            "set it to False in HYPER_PARAMS or pass --mode off.")
-
     # Collect entropy + group-construction features only when reweighting is on.
-    collect_groups = USE_ENTROPY_REWEIGHT or USE_ENTROPY_BONUS
-    needs_cvrp_feats = (USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'cvrp')
+    collect_groups   = USE_ENTROPY_REWEIGHT or USE_ENTROPY_BONUS
+    needs_cvrp_feats  = (USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'cvrp')
+    needs_vrptw_feats = (USE_ENTROPY_REWEIGHT and PROBLEM_TYPE == 'vrptw')
+    needs_route_feats = needs_cvrp_feats or needs_vrptw_feats
 
     while episode < TRAIN_EPISODES:
         batch_size = min(TRAIN_BATCH_SIZE, TRAIN_EPISODES - episode)
@@ -103,11 +100,18 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         if collect_groups:
             entropy_list    = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
             n_feasible_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if needs_cvrp_feats:
+        if needs_route_feats:
             at_depot_list  = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-            load_list      = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
             vis_ratio_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
-        if PROBLEM_TYPE == 'cvrp' and USE_ENTROPY_REWEIGHT:
+        if needs_cvrp_feats:
+            load_list = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+        if needs_vrptw_feats:
+            time_list  = torch.zeros(batch_size, POMO_SIZE, 0, device=device)
+            # per-instance normalizer for current_time: max customer tw_end.
+            # depot tw_end = 1e9 by construction; excluded via [:, 1:].
+            time_norm = env.tw_end[:, 1:].max(dim=1).values.clamp(min=1e-6)  # (B,)
+            time_norm = time_norm[:, None]                                    # (B, 1)
+        if needs_route_feats:
             finished_list = torch.zeros(batch_size, POMO_SIZE, 0,
                                          dtype=torch.bool, device=device)
         else:
@@ -124,7 +128,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 n_feasible_list = torch.cat(
                     (n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
 
-            if needs_cvrp_feats:
+            if needs_route_feats:
                 if state.current_node is None:
                     at_depot = torch.zeros(batch_size, POMO_SIZE, device=device)
                 else:
@@ -132,12 +136,19 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 at_depot_list = torch.cat(
                     (at_depot_list, at_depot[:, :, None]), dim=2)
 
-                load_list = torch.cat(
-                    (load_list, state.load[:, :, None]), dim=2)
-
                 vis_step = state.visited_customer_count.float() / max(PROBLEM_SIZE, 1)
                 vis_ratio_list = torch.cat(
                     (vis_ratio_list, vis_step[:, :, None]), dim=2)
+
+            if needs_cvrp_feats:
+                load_list = torch.cat(
+                    (load_list, state.load[:, :, None]), dim=2)
+
+            if needs_vrptw_feats:
+                # current_time is reset to 0 at depot; max customer tw_end caps it.
+                t_step = state.current_time / time_norm                  # (B, P) in ~[0,1]
+                time_list = torch.cat(
+                    (time_list, t_step[:, :, None]), dim=2)
 
             if finished_list is not None:
                 finished_list = torch.cat(
@@ -158,12 +169,21 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             if PROBLEM_TYPE == 'tsp':
                 gid, n_grp = build_group_id(
                     'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
-            else:
+            elif PROBLEM_TYPE == 'cvrp':
                 gid, n_grp = build_group_id(
-                    PROBLEM_TYPE,
+                    'cvrp',
                     n_feasible=n_feasible_list,
                     at_depot=at_depot_list,
                     load=load_list,
+                    vis_ratio=vis_ratio_list,
+                    n_bins=ENTROPY_N_BINS,
+                )
+            else:  # vrptw
+                gid, n_grp = build_group_id(
+                    'vrptw',
+                    n_feasible=n_feasible_list,
+                    at_depot=at_depot_list,
+                    time=time_list,
                     vis_ratio=vis_ratio_list,
                     n_bins=ENTROPY_N_BINS,
                 )
