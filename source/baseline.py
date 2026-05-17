@@ -294,3 +294,147 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
                                                                           # this equals raw H bucket mean.
     }
     return w, diag
+
+
+# ---------------------------------------------------------------------------
+# Monotonic-segment baseline: trajectory-internal contrast, no bucketing.
+#
+# Idea: instead of estimating environment_effect from "same state" cohorts
+# (which fails on CVRP/VRPTW because state→entropy is non-smooth), use the
+# trajectory's own local trend as anchor.
+#
+#   • Identify reversal points: t where sign(H_t − H_{t-1}) flips vs the
+#     previous diff. Each reversal closes the prior monotone run.
+#   • For each step t, anchor[t] = index of the most recent reversal at or
+#     before t (or step 0 if no reversal yet).
+#   • ΔH_local[t] = H_t − H[anchor[t]]
+#     — positive: trajectory is in an "entropy rising" segment at step t
+#     — negative: in an "entropy falling" segment
+#     — magnitude = how far the current monotone run has carried H
+#   • c_t = softmax over trajectory of (γ · sign(A) · ΔH_local), scaled to
+#     preserve Σ_t c_t = T_rw on rw steps. Valid-but-not-rw → c_t=1.
+#
+# No environment estimation needed. Tradeoffs:
+#   + zero bin/state similarity assumptions
+#   + every trajectory has its own anchor, no cross-instance noise
+#   − only captures "local trend" signal; misses absolute level info
+#   − early steps have weak signal (anchor is just step 0)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_monoseg_weights(entropy, valid_mask, advantage,
+                             gamma, n_feasible=None,
+                             apply_perturbation=True):
+    """
+    entropy:           (B, P, T) — model entropy per step
+    valid_mask:        (B, P, T) bool — True = real decision step
+    advantage:         (B, P)    — trajectory-level POMO advantage
+    gamma:             float     — perturbation amplitude in softmax logit
+    n_feasible:        (B, P, T) — feasible action count; forced steps
+                                    (n_feasible ≤ 1) excluded from rw_mask
+    apply_perturbation: bool     — warmup → c_t = 1 on valid, monitor only
+
+    Returns:
+        w:    (B, P, T) — invalid=0, valid-non-rw=1, rw=softmax-weighted (Σ=T_rw)
+        diag: dict {
+            'delta_H_local'      : (B, P, T) — segment-anchored Δ
+            'rw_mask'            : (B, P, T) bool
+            'rw_ratio'           : scalar
+            'n_segs_per_traj'    : scalar — mean number of monotone segments per traj
+            'seg_len_mean'       : scalar — mean monotone-run length (in steps)
+            'delta_pos_mean'     : scalar — mean ΔH_local over rising-segment steps
+            'delta_neg_mean'     : scalar — mean ΔH_local over falling-segment steps
+            'ct_top3'            : scalar — softmax c_t top-3 concentration per traj
+        }
+    """
+    B, P, T = entropy.shape
+    device = entropy.device
+    vmf = valid_mask.float()
+
+    # ── 1. First difference and its sign per (B, P, T). ──────────────────────
+    # diff[t] = H[t] - H[t-1] for t >= 1; diff[0] = 0.
+    diff = torch.zeros_like(entropy)
+    diff[:, :, 1:] = entropy[:, :, 1:] - entropy[:, :, :-1]
+    sd = diff.sign()                                              # ±1 or 0
+
+    # ── 2. Reversal indicator: sign changes between consecutive diffs. ───────
+    # reversal[t] = True iff sd[t] and sd[t-1] are both non-zero and opposite.
+    # Treat 0 (flat segment) as "continues previous direction" → no reversal.
+    # reversal_at_step[t] in (B,P,T): a reversal occurred at step t (t >= 2).
+    reversal_at_step = torch.zeros(B, P, T, dtype=torch.bool, device=device)
+    if T >= 3:
+        sd_t   = sd[:, :, 2:]              # (B, P, T-2)  — sign(H_t - H_{t-1})
+        sd_tm1 = sd[:, :, 1:-1]            # (B, P, T-2)  — sign(H_{t-1} - H_{t-2})
+        flip = (sd_t * sd_tm1 < 0)         # both non-zero AND opposite signs
+        reversal_at_step[:, :, 2:] = flip
+    # The "anchor" we want is the position where the NEW trend STARTS, which
+    # is the step BEFORE the reversal-detected step (the local extremum):
+    #   if reversal_at_step[t] = True, then anchor for t..next_rev-1 is t-1.
+    # Implement via cumulative max over (step_idx if reversal else 0), then
+    # subtract 1 to get the extremum's index — but for t=0,1 we must keep 0.
+    step_idx = torch.arange(T, device=device).view(1, 1, T).expand(B, P, T)
+    rev_step = torch.where(reversal_at_step,
+                            (step_idx - 1).clamp(min=0),
+                            torch.zeros_like(step_idx))
+    anchor = rev_step.cummax(dim=2).values                       # (B, P, T) long
+
+    # ── 3. ΔH_local = H_t − H[anchor[t]]. ────────────────────────────────────
+    H_at_anchor = torch.gather(entropy, dim=2, index=anchor)
+    delta_H_local = entropy - H_at_anchor                         # (B, P, T)
+
+    if not apply_perturbation:
+        delta_H_local = torch.zeros_like(delta_H_local)
+
+    # ── 4. rw_mask: valid & not forced. No bucket-sufficiency needed. ────────
+    if n_feasible is not None:
+        rw_mask = valid_mask & (n_feasible > 1)
+    else:
+        rw_mask = valid_mask.clone()
+
+    # ── 5. softmax c_t over trajectory (rw subset). ─────────────────────────
+    sign_A = advantage.sign().unsqueeze(2)                        # (B, P, 1)
+    logit = (gamma * sign_A * delta_H_local).masked_fill(~rw_mask, -1e9)
+    T_rw = rw_mask.float().sum(dim=2, keepdim=True).clamp(min=1.0)
+    w_rw = torch.softmax(logit, dim=2) * T_rw
+
+    # Compose: invalid → 0; valid & not rw → 1; rw → softmax weight.
+    w = torch.where(rw_mask, w_rw, vmf)
+
+    # ── 6. Diagnostics. ─────────────────────────────────────────────────────
+    # rw coverage
+    rw_per_inst    = rw_mask.float().sum(dim=(1, 2))
+    valid_per_inst = vmf.sum(dim=(1, 2)).clamp(min=1.0)
+    rw_ratio = (rw_per_inst / valid_per_inst).mean()
+
+    # segments per trajectory: count reversal_at_step among valid steps + 1
+    # (first segment has no leading reversal, so add 1 if any valid steps exist)
+    rev_valid = reversal_at_step & valid_mask
+    n_segs_per_traj = rev_valid.float().sum(dim=2).mean() + 1.0
+
+    # mean segment length = T_valid / n_segs
+    T_valid_per_traj = valid_mask.float().sum(dim=2).clamp(min=1.0)        # (B, P)
+    n_segs_per_xtraj = rev_valid.float().sum(dim=2) + 1.0                   # (B, P)
+    seg_len_mean = (T_valid_per_traj / n_segs_per_xtraj).mean()
+
+    # ΔH_local mean on rising/falling rw steps
+    pos_mask = rw_mask & (delta_H_local > 0)
+    neg_mask = rw_mask & (delta_H_local < 0)
+    delta_pos_mean = (delta_H_local * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)
+    delta_neg_mean = (delta_H_local * neg_mask.float()).sum() / neg_mask.float().sum().clamp(min=1.0)
+
+    # c_t top-3 concentration per trajectory: how peaky is the softmax?
+    # Higher = the trajectory's weight is concentrated on a few decisive steps.
+    ct_top3_per_traj = w_rw.topk(min(3, T), dim=2).values.sum(dim=2)        # (B, P)
+    ct_top3 = (ct_top3_per_traj / T_rw.squeeze(2).clamp(min=1.0)).mean()
+
+    diag = {
+        'delta_H_local':   delta_H_local.detach(),
+        'rw_mask':         rw_mask.detach(),
+        'rw_ratio':        rw_ratio.detach(),
+        'n_segs_per_traj': n_segs_per_traj.detach(),
+        'seg_len_mean':    seg_len_mean.detach(),
+        'delta_pos_mean':  delta_pos_mean.detach(),
+        'delta_neg_mean':  delta_neg_mean.detach(),
+        'ct_top3':         ct_top3.detach(),
+    }
+    return w, diag

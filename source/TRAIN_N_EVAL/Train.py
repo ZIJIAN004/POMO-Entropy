@@ -38,7 +38,8 @@ import torch
 
 from HYPER_PARAMS import *
 from source.utilities import Average_Meter
-from source.baseline import build_group_id, compute_entropy_z_weights
+from source.baseline import (build_group_id, compute_entropy_z_weights,
+                              compute_monoseg_weights)
 
 
 def _make_valid_mask(T_total, batch_size, device, finished_list=None):
@@ -73,6 +74,13 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     asnr_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # |A|/σ_A — H2 probe
     gmMed_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # median grp_mean among rw steps
     lowGrp_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in groups with grp_mean<0.05
+
+    # ── Monoseg-mode diagnostics (only used when USE_MONOSEG_BASELINE) ──────
+    nsegs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean segments per traj
+    seglen_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean segment length
+    dPos_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on rising-seg steps
+    dNeg_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on falling-seg steps
+    ctTop3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # softmax c_t top-3 concentration
 
     logger_start = time.time()
     episode      = 0
@@ -167,93 +175,120 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             T_total = prob_list.size(2)
             valid   = _make_valid_mask(T_total, batch_size, device, finished_list)
 
-            # USE_VIS_RATIO_BIN=False → 3-dim bucket (drop vis_ratio).
-            vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
-            if PROBLEM_TYPE == 'tsp':
-                gid, n_grp = build_group_id(
-                    'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
-            elif PROBLEM_TYPE == 'cvrp':
-                gid, n_grp = build_group_id(
-                    'cvrp',
+            if USE_MONOSEG_BASELINE:
+                # Trajectory-internal monotonic-segment baseline. No bucketing.
+                weights, diag = compute_monoseg_weights(
+                    entropy=entropy_list,
+                    valid_mask=valid,
+                    advantage=advantage,
+                    gamma=ENTROPY_GAMMA,
                     n_feasible=n_feasible_list,
-                    at_depot=at_depot_list,
-                    load=load_list,
-                    vis_ratio=vis_arg,
-                    n_bins=ENTROPY_N_BINS,
+                    apply_perturbation=apply_pert,
                 )
-            else:  # vrptw
-                gid, n_grp = build_group_id(
-                    'vrptw',
+                log_prob = (prob_list.log() * weights).sum(dim=2)
+
+                if rw_AM is not None:
+                    rw_AM.push(diag['rw_ratio'].unsqueeze(0))
+                if nsegs_AM is not None:
+                    nsegs_AM.push(diag['n_segs_per_traj'].unsqueeze(0))
+                if seglen_AM is not None:
+                    seglen_AM.push(diag['seg_len_mean'].unsqueeze(0))
+                if dPos_AM is not None:
+                    dPos_AM.push(diag['delta_pos_mean'].unsqueeze(0))
+                if dNeg_AM is not None:
+                    dNeg_AM.push(diag['delta_neg_mean'].unsqueeze(0))
+                if ctTop3_AM is not None:
+                    ctTop3_AM.push(diag['ct_top3'].unsqueeze(0))
+
+                with torch.no_grad():
+                    A_snr = (advantage.abs() /
+                             advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
+                    asnr_AM.push(A_snr.unsqueeze(0))
+            else:
+                # USE_VIS_RATIO_BIN=False → 3-dim bucket (drop vis_ratio).
+                vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
+                if PROBLEM_TYPE == 'tsp':
+                    gid, n_grp = build_group_id(
+                        'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
+                elif PROBLEM_TYPE == 'cvrp':
+                    gid, n_grp = build_group_id(
+                        'cvrp',
+                        n_feasible=n_feasible_list,
+                        at_depot=at_depot_list,
+                        load=load_list,
+                        vis_ratio=vis_arg,
+                        n_bins=ENTROPY_N_BINS,
+                    )
+                else:  # vrptw
+                    gid, n_grp = build_group_id(
+                        'vrptw',
+                        n_feasible=n_feasible_list,
+                        at_depot=at_depot_list,
+                        time=time_list,
+                        vis_ratio=vis_arg,
+                        n_bins=ENTROPY_N_BINS,
+                    )
+
+                weights, diag = compute_entropy_z_weights(
+                    entropy=entropy_list,
+                    valid_mask=valid,
+                    advantage=advantage,
+                    gid=gid,
+                    n_grp_per_inst=n_grp,
+                    gamma=ENTROPY_GAMMA,
+                    min_group_size=ENTROPY_MIN_GROUP_SIZE,
+                    apply_perturbation=apply_pert,
+                    use_bidir_norm=USE_BIDIR_NORM,
+                    use_softmax_norm=USE_SOFTMAX_NORM,
                     n_feasible=n_feasible_list,
-                    at_depot=at_depot_list,
-                    time=time_list,
-                    vis_ratio=vis_arg,
-                    n_bins=ENTROPY_N_BINS,
+                    low_grp_mean_thresh=LOW_GRP_MEAN_THRESH,
                 )
+                log_prob = (prob_list.log() * weights).sum(dim=2)
 
-            weights, diag = compute_entropy_z_weights(
-                entropy=entropy_list,
-                valid_mask=valid,
-                advantage=advantage,
-                gid=gid,
-                n_grp_per_inst=n_grp,
-                gamma=ENTROPY_GAMMA,
-                min_group_size=ENTROPY_MIN_GROUP_SIZE,
-                apply_perturbation=apply_pert,
-                use_bidir_norm=USE_BIDIR_NORM,
-                use_softmax_norm=USE_SOFTMAX_NORM,
-                n_feasible=n_feasible_list,
-                low_grp_mean_thresh=LOW_GRP_MEAN_THRESH,
-            )
-            log_prob = (prob_list.log() * weights).sum(dim=2)
+                if top3_AM is not None:
+                    top3_AM.push(diag['top3_concentration'].unsqueeze(0))
+                if small_AM is not None:
+                    small_AM.push(diag['small_group_ratio'].unsqueeze(0))
+                if rw_AM is not None:
+                    rw_AM.push(diag['rw_ratio'].unsqueeze(0))
+                if r2_AM is not None:
+                    r2_AM.push(diag['r2_grp'].unsqueeze(0))
 
-            if top3_AM is not None:
-                top3_AM.push(diag['top3_concentration'].unsqueeze(0))
-            if small_AM is not None:
-                small_AM.push(diag['small_group_ratio'].unsqueeze(0))
-            if rw_AM is not None:
-                rw_AM.push(diag['rw_ratio'].unsqueeze(0))
-            if r2_AM is not None:
-                r2_AM.push(diag['r2_grp'].unsqueeze(0))
+                # ── H1 diagnostic (TSP-vs-CVRP comparison) ─────────────────
+                # Partition rw steps by their GROUP's grp_mean (median split).
+                with torch.no_grad():
+                    dH    = diag['delta_H']             # (B, P, T)
+                    rwm   = diag['rw_mask']             # (B, P, T) bool
+                    gm    = diag['grp_mean']            # (B, P, T)
+                    A_exp = advantage.unsqueeze(2).expand_as(dH)
 
-            # ── H1 diagnostic (TSP-vs-CVRP comparison) ─────────────────────
-            # Partition rw steps by their GROUP's grp_mean (median split).
-            # Each (instance, gid) bucket shares one grp_mean/grp_std — that's
-            # the natural unit of "is this group informative or noise?".
-            with torch.no_grad():
-                dH    = diag['delta_H']             # (B, P, T)
-                rwm   = diag['rw_mask']             # (B, P, T) bool
-                gm    = diag['grp_mean']            # (B, P, T), per-step bucket-broadcast
-                A_exp = advantage.unsqueeze(2).expand_as(dH)
+                    gm_rw = gm[rwm]
+                    if gm_rw.numel() > 100:
+                        gm_thresh = gm_rw.median()
+                        high = rwm & (gm >  gm_thresh)
+                        low  = rwm & (gm <= gm_thresh)
 
-                gm_rw = gm[rwm]
-                if gm_rw.numel() > 100:
-                    gm_thresh = gm_rw.median()
-                    high = rwm & (gm >  gm_thresh)   # rw steps in high-grp_mean buckets
-                    low  = rwm & (gm <= gm_thresh)   # rw steps in low-grp_mean buckets
+                        def _pearson(mask):
+                            n = int(mask.sum())
+                            if n < 100: return None
+                            x = dH[mask]
+                            y = A_exp[mask]
+                            x = x - x.mean(); y = y - y.mean()
+                            d = (x.std() * y.std()).clamp(min=1e-8)
+                            return ((x * y).mean() / d).unsqueeze(0)
 
-                    def _pearson(mask):
-                        n = int(mask.sum())
-                        if n < 100: return None
-                        x = dH[mask]
-                        y = A_exp[mask]
-                        x = x - x.mean(); y = y - y.mean()
-                        d = (x.std() * y.std()).clamp(min=1e-8)
-                        return ((x * y).mean() / d).unsqueeze(0)
+                        c_hi = _pearson(high)
+                        c_lo = _pearson(low)
+                        if c_hi is not None: corrH_AM.push(c_hi)
+                        if c_lo is not None: corrL_AM.push(c_lo)
 
-                    c_hi = _pearson(high)
-                    c_lo = _pearson(low)
-                    if c_hi is not None: corrH_AM.push(c_hi)
-                    if c_lo is not None: corrL_AM.push(c_lo)
+                        gmMed_AM.push(gm_thresh.unsqueeze(0))
+                        lowGrp = (rwm & (gm < 0.05)).float().sum() / rwm.float().sum().clamp(min=1.0)
+                        lowGrp_AM.push(lowGrp.unsqueeze(0))
 
-                    gmMed_AM.push(gm_thresh.unsqueeze(0))
-                    # Share of rw steps that live in "near-forced" low-entropy buckets
-                    lowGrp = (rwm & (gm < 0.05)).float().sum() / rwm.float().sum().clamp(min=1.0)
-                    lowGrp_AM.push(lowGrp.unsqueeze(0))
-
-                A_snr = (advantage.abs() /
-                         advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
-                asnr_AM.push(A_snr.unsqueeze(0))
+                    A_snr = (advantage.abs() /
+                             advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
+                    asnr_AM.push(A_snr.unsqueeze(0))
         else:
             log_prob = prob_list.log().sum(dim=2)
 
@@ -274,12 +309,24 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         if time.time() - logger_start > LOG_PERIOD_SEC or episode >= TRAIN_EPISODES:
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - timer_start))
             extra = ""
-            if top3_AM is not None and top3_AM.count > 0:
-                phase = "warmup" if not apply_pert else "active"
+            phase = "warmup" if not apply_pert else "active"
+            if USE_MONOSEG_BASELINE and rw_AM is not None and rw_AM.count > 0:
+                # Monoseg-mode log: trajectory-internal trend signals.
+                extra = ("  Mseg({}): rw={:.3f}  nsegs={:.1f}  seglen={:.1f}"
+                         "  ΔH±=({:+.3f}/{:+.3f})  ctTop3={:.3f}"
+                         "  |A|/σ_A={:.3f}").format(
+                    phase, rw_AM.result(),
+                    nsegs_AM.result() if nsegs_AM.count > 0 else float('nan'),
+                    seglen_AM.result() if seglen_AM.count > 0 else float('nan'),
+                    dPos_AM.result() if dPos_AM.count > 0 else float('nan'),
+                    dNeg_AM.result() if dNeg_AM.count > 0 else float('nan'),
+                    ctTop3_AM.result() if ctTop3_AM.count > 0 else float('nan'),
+                    asnr_AM.result() if asnr_AM.count > 0 else float('nan'))
+            elif top3_AM is not None and top3_AM.count > 0:
+                # Bucket-mode log (unchanged).
                 extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f} R²={:.3f}".format(
                     phase, top3_AM.result(), small_AM.result(), rw_AM.result(),
                     r2_AM.result() if r2_AM.count > 0 else float('nan'))
-                # H1 diagnostic readout (group-level partition)
                 if corrH_AM is not None and corrH_AM.count > 0:
                     cH = corrH_AM.result()
                     cL = corrL_AM.result() if corrL_AM.count > 0 else float('nan')

@@ -101,6 +101,18 @@ USE_SOFTMAX_NORM         = False
 USE_VIS_RATIO_BIN        = True
 LOW_GRP_MEAN_THRESH      = 0.0
 
+# ── Monotonic-segment baseline (alternative to bucket baseline) ─────────────
+# When True, ΔH_t is computed as H_t − H[anchor_t], where anchor_t is the
+# most recent "local extremum" (trend reversal) at or before t in the same
+# trajectory. No bucketing, no environment estimation. Softmax over the full
+# trajectory's rw steps then redistributes c_t with sign(A)·ΔH_local as the
+# logit. Use to test whether trajectory-internal trend signal beats
+# bucket-based environment baselines on CVRP/VRPTW.
+# When True, USE_VIS_RATIO_BIN / LOW_GRP_MEAN_THRESH / USE_BIDIR_NORM are
+# ignored (they apply only to bucket baseline). USE_SOFTMAX_NORM is also
+# implicit-True (monoseg always uses softmax).
+USE_MONOSEG_BASELINE     = False
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)

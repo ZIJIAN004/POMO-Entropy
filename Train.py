@@ -36,6 +36,9 @@ _parser.add_argument('--vis-ratio', type=str, default=None, choices=['on', 'off'
 _parser.add_argument('--lowg-thresh', type=float, default=None,
                      help='strip rw eligibility from buckets with grp_mean < '
                           'this threshold. 0 = no filter; 0.05 ≈ "low-entropy mask".')
+_parser.add_argument('--monoseg', type=str, default=None, choices=['on', 'off'],
+                     help='use monotonic-segment baseline instead of bucket: '
+                          'ΔH_t = H_t − H[last_reversal_t], softmax over trajectory.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -60,20 +63,25 @@ if _args.vis_ratio is not None:
     _HP.USE_VIS_RATIO_BIN = (_args.vis_ratio == 'on')
 if _args.lowg_thresh is not None:
     _HP.LOW_GRP_MEAN_THRESH = _args.lowg_thresh
+if _args.monoseg is not None:
+    _HP.USE_MONOSEG_BASELINE = (_args.monoseg == 'on')
 
 from HYPER_PARAMS import *
 
 _tag = ""
 if USE_ENTROPY_REWEIGHT:
     _tag += "-Z_g{}_w{}".format(ENTROPY_GAMMA, ENTROPY_WARMUP_EPOCHS)
-    if USE_BIDIR_NORM:
-        _tag += "-Bd"
-    if USE_SOFTMAX_NORM:
-        _tag += "-Sm"
-    if PROBLEM_TYPE in ('cvrp', 'vrptw') and not USE_VIS_RATIO_BIN:
-        _tag += "-noVR"
-    if LOW_GRP_MEAN_THRESH > 0.0:
-        _tag += "-Lm{}".format(LOW_GRP_MEAN_THRESH)
+    if USE_MONOSEG_BASELINE:
+        _tag += "-Mseg"
+    else:
+        if USE_BIDIR_NORM:
+            _tag += "-Bd"
+        if USE_SOFTMAX_NORM:
+            _tag += "-Sm"
+        if PROBLEM_TYPE in ('cvrp', 'vrptw') and not USE_VIS_RATIO_BIN:
+            _tag += "-noVR"
+        if LOW_GRP_MEAN_THRESH > 0.0:
+            _tag += "-Lm{}".format(LOW_GRP_MEAN_THRESH)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
