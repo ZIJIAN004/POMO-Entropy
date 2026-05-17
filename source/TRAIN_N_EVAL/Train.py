@@ -61,6 +61,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     loss_AM  = Average_Meter()
     top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
+    rw_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None
 
     logger_start = time.time()
     episode      = 0
@@ -176,6 +177,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 top3_AM.push(diag['top3_concentration'].unsqueeze(0))
             if small_AM is not None:
                 small_AM.push(diag['small_group_ratio'].unsqueeze(0))
+            if rw_AM is not None:
+                rw_AM.push(diag['rw_ratio'].unsqueeze(0))
         else:
             log_prob = prob_list.log().sum(dim=2)
 
@@ -198,8 +201,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             extra = ""
             if top3_AM is not None and top3_AM.count > 0:
                 phase = "warmup" if not apply_pert else "active"
-                extra = "  Z({}):top3={:.3f} small={:.3f}".format(
-                    phase, top3_AM.result(), small_AM.result())
+                extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f}".format(
+                    phase, top3_AM.result(), small_AM.result(), rw_AM.result())
             logger.info('Ep:{:03d}-{:07d}({:5.1f}%)  T:{}  Loss:{:+.4f}  Avg.best_dist:{:.4f}{}'.format(
                 epoch, episode, 100. * episode / TRAIN_EPISODES,
                 elapsed, loss_AM.result(), score_AM.result(), extra))

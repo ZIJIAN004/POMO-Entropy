@@ -182,6 +182,15 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
     delta_H = delta_H.reshape(B, P, T)
     suff_step = sufficient_per_step.view(B, P, T).bool()             # (B, P, T)
 
+    # Reweight-eligible: valid AND in a sufficient bucket AND not forced.
+    # Computed once and reused by softmax c_t and the rw_ratio diagnostic.
+    # If n_feasible is not provided (linear-only callers), we fall back to
+    # (valid & sufficient) — same shape, used purely for monitoring.
+    if n_feasible is not None:
+        rw_mask = valid_mask & suff_step & (n_feasible > 1)          # (B, P, T) bool
+    else:
+        rw_mask = valid_mask & suff_step
+
     # ── c_t: linear (1+γ·sign(A)·ΔH) or isolated softmax over rw subset ──────
     sign_A = advantage.sign().unsqueeze(2)                           # (B, P, 1)
     if use_softmax_norm:
@@ -189,12 +198,9 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
             "use_softmax_norm=True requires n_feasible (B,P,T) to identify "
             "forced (n_feasible≤1) steps that must stay at c_t=1.")
 
-        # Reweight-eligible: valid AND in a sufficient bucket AND not forced.
         # Small-group (suff_step=False) and forced (n_feasible≤1) steps are
         # held at c_t=1 — isolated from the softmax denominator so they
         # neither dilute the redistribution nor get diluted by it.
-        rw_mask = valid_mask & suff_step & (n_feasible > 1)          # (B, P, T) bool
-
         logit = (gamma * sign_A * delta_H).masked_fill(~rw_mask, -1e9)
         T_rw  = rw_mask.float().sum(dim=2, keepdim=True).clamp(min=1.0)
         w_rw  = torch.softmax(logit, dim=2) * T_rw                    # softmax over rw only
@@ -217,8 +223,17 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
                        (counts_per_inst < float(min_group_size)).float()).sum(dim=1)
     small_group_ratio = (small_per_inst / total_per_inst).mean()
 
+    # rw_ratio: per-instance fraction of valid steps that pass into softmax
+    # reweighting (≡ valid & sufficient_bucket & n_feasible>1 when n_feasible
+    # given; ≡ valid & sufficient_bucket otherwise). Low rw_ratio = most steps
+    # are baseline-treated, reweighting has little leverage on the trajectory.
+    rw_per_inst    = rw_mask.float().sum(dim=(1, 2))                  # (B,)
+    valid_per_inst = vmf.sum(dim=(1, 2)).clamp(min=1.0)               # (B,)
+    rw_ratio = (rw_per_inst / valid_per_inst).mean()
+
     diag = {
         'top3_concentration': top3_concentration.detach(),
         'small_group_ratio':  small_group_ratio.detach(),
+        'rw_ratio':           rw_ratio.detach(),
     }
     return w, diag
