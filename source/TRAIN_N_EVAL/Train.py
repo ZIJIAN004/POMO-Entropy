@@ -62,12 +62,16 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
     rw_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None
-    # H1 diagnostic: corr(ΔH, A) on rw steps, split by H quantile.
-    # Hypothesis: if low-H rw steps are credit-misallocated, corr_low ≪ corr_high.
-    corrH_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # high-H rw subset
-    corrL_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # low-H  rw subset
-    asnr_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # |A|/σ_A — H2 probe
-    hfrac_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # high-H rw share
+    # H1 diagnostic: corr(ΔH, A) on rw steps, partitioned by GROUP grp_mean.
+    # Reweighting operates per-group (grp_mean/grp_std shared by all steps in
+    # a bucket), so the right partitioning unit is the group, not the step.
+    # Hypothesis: if low-grp_mean groups carry misallocated credit, corr in
+    # low-grp half ≪ corr in high-grp half.
+    corrH_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in high-grp_mean groups
+    corrL_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in low-grp_mean groups
+    asnr_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # |A|/σ_A — H2 probe
+    gmMed_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # median grp_mean among rw steps
+    lowGrp_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in groups with grp_mean<0.05
 
     logger_start = time.time()
     episode      = 0
@@ -187,19 +191,20 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 rw_AM.push(diag['rw_ratio'].unsqueeze(0))
 
             # ── H1 diagnostic (TSP-vs-CVRP comparison) ─────────────────────
-            # corr(ΔH, A) on rw steps, partitioned by H median among rw steps.
-            # ΔH from diag is post-z-score (sigma units, mean 0). A is per-traj.
+            # Partition rw steps by their GROUP's grp_mean (median split).
+            # Each (instance, gid) bucket shares one grp_mean/grp_std — that's
+            # the natural unit of "is this group informative or noise?".
             with torch.no_grad():
                 dH    = diag['delta_H']             # (B, P, T)
                 rwm   = diag['rw_mask']             # (B, P, T) bool
+                gm    = diag['grp_mean']            # (B, P, T), per-step bucket-broadcast
                 A_exp = advantage.unsqueeze(2).expand_as(dH)
 
-                # Median split by raw entropy among rw steps
-                H_rw = entropy_list[rwm]
-                if H_rw.numel() > 100:
-                    H_thresh = H_rw.median()
-                    high = rwm & (entropy_list >  H_thresh)
-                    low  = rwm & (entropy_list <= H_thresh)
+                gm_rw = gm[rwm]
+                if gm_rw.numel() > 100:
+                    gm_thresh = gm_rw.median()
+                    high = rwm & (gm >  gm_thresh)   # rw steps in high-grp_mean buckets
+                    low  = rwm & (gm <= gm_thresh)   # rw steps in low-grp_mean buckets
 
                     def _pearson(mask):
                         n = int(mask.sum())
@@ -214,8 +219,11 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     c_lo = _pearson(low)
                     if c_hi is not None: corrH_AM.push(c_hi)
                     if c_lo is not None: corrL_AM.push(c_lo)
-                    hfrac_AM.push(
-                        (high.float().sum() / rwm.float().sum().clamp(min=1.0)).unsqueeze(0))
+
+                    gmMed_AM.push(gm_thresh.unsqueeze(0))
+                    # Share of rw steps that live in "near-forced" low-entropy buckets
+                    lowGrp = (rwm & (gm < 0.05)).float().sum() / rwm.float().sum().clamp(min=1.0)
+                    lowGrp_AM.push(lowGrp.unsqueeze(0))
 
                 A_snr = (advantage.abs() /
                          advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
@@ -244,14 +252,15 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 phase = "warmup" if not apply_pert else "active"
                 extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f}".format(
                     phase, top3_AM.result(), small_AM.result(), rw_AM.result())
-                # H1 diagnostic readout
+                # H1 diagnostic readout (group-level partition)
                 if corrH_AM is not None and corrH_AM.count > 0:
-                    cH = corrH_AM.result() if corrH_AM.count > 0 else float('nan')
+                    cH = corrH_AM.result()
                     cL = corrL_AM.result() if corrL_AM.count > 0 else float('nan')
-                    hf = hfrac_AM.result() if hfrac_AM.count > 0 else float('nan')
+                    gmMed = gmMed_AM.result() if gmMed_AM.count > 0 else float('nan')
+                    lowG = lowGrp_AM.result() if lowGrp_AM.count > 0 else float('nan')
                     asnr = asnr_AM.result() if asnr_AM.count > 0 else float('nan')
-                    extra += "  H1: corr(hi/lo)={:+.4f}/{:+.4f}  hi_frac={:.2f}  |A|/σ_A={:.3f}".format(
-                        cH, cL, hf, asnr)
+                    extra += "  H1: corr(hiG/loG)={:+.4f}/{:+.4f}  gm_med={:.3f}  lowG(<.05)={:.2f}  |A|/σ_A={:.3f}".format(
+                        cH, cL, gmMed, lowG, asnr)
             logger.info('Ep:{:03d}-{:07d}({:5.1f}%)  T:{}  Loss:{:+.4f}  Avg.best_dist:{:.4f}{}'.format(
                 epoch, episode, 100. * episode / TRAIN_EPISODES,
                 elapsed, loss_AM.result(), score_AM.result(), extra))

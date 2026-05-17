@@ -235,7 +235,11 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
         'top3_concentration': top3_concentration.detach(),
         'small_group_ratio':  small_group_ratio.detach(),
         'rw_ratio':           rw_ratio.detach(),
-        'delta_H':            delta_H.detach(),       # (B, P, T) — exposed for H1 diagnostic
-        'rw_mask':            rw_mask.detach(),       # (B, P, T) bool
+        'delta_H':            delta_H.detach(),                          # (B, P, T)
+        'rw_mask':            rw_mask.detach(),                          # (B, P, T) bool
+        'grp_mean':           grp_mean.view(B, P, T).detach(),           # bucket mean of H_in,
+                                                                          # per-step broadcast.
+                                                                          # When use_bidir_norm=False
+                                                                          # this equals raw H bucket mean.
     }
     return w, diag
