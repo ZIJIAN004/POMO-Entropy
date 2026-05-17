@@ -99,6 +99,26 @@ USE_ENTROPY_BONUS    = False
 ENTROPY_BONUS_BETA   = 0.01
 
 # ===========================================================================
+# SVD-Reward (per-instance subspace-similarity advantage)
+#
+# Replaces the POMO cost-baseline `advantage = R - mean(R)` with a hybrid:
+#     advantage = α · znorm(−svd_residual) + (1−α) · znorm(R)
+# where svd_residual is the orthogonal-residual norm of each tour's
+# embedding to the per-instance SVD subspace defined by the top-K shortest
+# rollouts. α=0 falls back to baseline POMO; α=1 is pure SVD.
+#
+# Requires a pretrained TourAutoEncoder checkpoint from the SVD-Reward
+# project (sibling directory by convention; override via SVD_REWARD_PATH
+# env var). TSP only — CVRP/VRPTW not yet supported.
+# ===========================================================================
+USE_SVD_REWARD = False
+SVD_CKPT_PATH  = ''        # e.g. '../SVD-Reward/checkpoints/best_model.pt'
+SVD_ALPHA      = 0.5       # hybrid weight: 0 = baseline, 1 = pure SVD
+SVD_RANK       = 16        # per-instance SVD rank
+SVD_TOP_K      = 50        # # anchors (top-shortest per instance)
+SVD_KNN_K      = 10        # KNN connectivity for instance graph (match AE training)
+
+# ===========================================================================
 # Checkpoint & Resume
 # ===========================================================================
 RESUME                = False     # 是否从 checkpoint 断点续训

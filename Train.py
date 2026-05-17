@@ -28,6 +28,12 @@ _parser.add_argument('--bidir', type=str, default=None, choices=['on', 'off'],
 _parser.add_argument('--softmax', type=str, default=None, choices=['on', 'off'],
                      help='softmax c_t = softmax(γ·sign(A)·ΔH, dim=step)·T_valid '
                           'instead of linear c_t = 1+γ·sign(A)·ΔH.')
+_parser.add_argument('--svd-ckpt', type=str, default=None,
+                     help='path to SVD-Reward TourAutoEncoder checkpoint; '
+                          'enables hybrid advantage. TSP only.')
+_parser.add_argument('--svd-alpha', type=float, default=None,
+                     help='SVD hybrid weight (0=baseline POMO, 1=pure SVD, '
+                          '0.5=balanced). Default from HYPER_PARAMS.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -46,6 +52,11 @@ if _args.bidir is not None:
     _HP.USE_BIDIR_NORM = (_args.bidir == 'on')
 if _args.softmax is not None:
     _HP.USE_SOFTMAX_NORM = (_args.softmax == 'on')
+if _args.svd_ckpt is not None:
+    _HP.USE_SVD_REWARD = True
+    _HP.SVD_CKPT_PATH  = _args.svd_ckpt
+if _args.svd_alpha is not None:
+    _HP.SVD_ALPHA = _args.svd_alpha
 
 from HYPER_PARAMS import *
 
@@ -58,6 +69,8 @@ if USE_ENTROPY_REWEIGHT:
         _tag += "-Sm"
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
+if USE_SVD_REWARD:
+    _tag += "-SVD_a{}".format(SVD_ALPHA)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
 print(SAVE_FOLDER_NAME)
 
