@@ -42,6 +42,9 @@ _parser.add_argument('--monoseg', type=str, default=None, choices=['on', 'off'],
 _parser.add_argument('--postbucket', type=str, default=None, choices=['on', 'off'],
                      help='only with --monoseg on: subtract bucket-mean of '
                           'ΔH_local within (n_feasible, at_depot, load_bin).')
+_parser.add_argument('--seed', type=int, default=None,
+                     help='random seed for torch/numpy/random (None = no seeding, '
+                          'CUDA non-deterministic). Run name gets -s{seed} suffix.')
 _args, _ = _parser.parse_known_args()
 
 import HYPER_PARAMS as _HP
@@ -91,16 +94,28 @@ if USE_ENTROPY_REWEIGHT:
             _tag += "-Lm{}".format(LOW_GRP_MEAN_THRESH)
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
+if _args.seed is not None:
+    _tag += "-s{}".format(_args.seed)
 SAVE_FOLDER_NAME = "POMO_{}_n{}{}".format(PROBLEM_TYPE.upper(), PROBLEM_SIZE, _tag)
 print(SAVE_FOLDER_NAME)
 
 import os
+import random
 import shutil
 import time
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
+
+# ── Seed control ─────────────────────────────────────────────────────────────
+if _args.seed is not None:
+    random.seed(_args.seed)
+    np.random.seed(_args.seed)
+    torch.manual_seed(_args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_args.seed)
+    print(f"[seed] random/numpy/torch seeded with {_args.seed}")
 import matplotlib
 matplotlib.use('Agg')   # headless-safe: no display, no blocking plt.show()
 from matplotlib import pyplot as plt
