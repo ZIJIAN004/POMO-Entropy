@@ -120,6 +120,13 @@ USE_MONOSEG_BASELINE     = False
 # typical "anchor→t" trend at that state class.
 USE_MONOSEG_POSTBUCKET   = False
 
+# Robust normalization: replace mean+std with median+IQR/1.349 per bucket.
+# Small buckets with under-estimated grp_std produce |ΔH| >> 1 outliers under
+# z-score because std is corrupted by 1-2 extreme values. Quantile-based
+# location (median) and scale (IQR) are robust to up to ~25% outliers per
+# bucket. Only effective on the bucket path (not monoseg). Default False.
+USE_ROBUST_NORM          = False
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)

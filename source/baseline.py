@@ -98,6 +98,75 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 
 
 # ---------------------------------------------------------------------------
+# Segmented median + IQR helper. For each bucket (gid), compute median and
+# IQR over valid steps without per-bucket Python loops.
+#
+# Trick: stable-sort the flat (N,) array by a composite key  gid * BIG + H,
+# with invalid-step H replaced by LARGE (< BIG) so they land at each
+# bucket's tail. After sort, each bucket g occupies contiguous positions
+# [offset[g], offset[g]+total[g]); valid items are sorted ascending in
+# [offset[g], offset[g]+valid_count[g]). Quartile positions are computed
+# by integer arithmetic on valid_count.
+#
+# Complexity: O(N log N) via the single sort, plus O(n_grp_total) scatters.
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _segmented_median_iqr(values_flat, valid_mask_flat, gid_global,
+                           n_grp_total, counts):
+    """
+    values_flat:      (N,) float — H_in flattened
+    valid_mask_flat:  (N,) float — 1.0 on valid steps, else 0.0
+    gid_global:       (N,) long  — global bucket id with batch offset
+    n_grp_total:      int        — B · n_grp_per_inst
+    counts:           (n_grp_total,) float — valid count per bucket (pre-computed)
+
+    Returns:
+        grp_loc   (n_grp_total,) — bucket median over valid steps
+        grp_scale (n_grp_total,) — bucket IQR / 1.349 (≥ 1e-8 floor)
+    """
+    device = values_flat.device
+    dtype  = values_flat.dtype
+    N      = values_flat.shape[0]
+
+    # Compose sort key in float64: gid * BIG + H_for_sort.
+    # BIG > LARGE > max(realistic entropy ~ log(POMO_SIZE) ≈ 5 on 100-way).
+    BIG   = 1e4
+    LARGE = 1e3
+    H_for_sort = values_flat.clone()
+    H_for_sort[valid_mask_flat < 0.5] = LARGE   # invalid → tail of each bucket
+
+    sort_key   = gid_global.double() * BIG + H_for_sort.double()
+    sorted_idx = sort_key.argsort()
+
+    values_sorted = values_flat[sorted_idx]      # original H, sorted within bucket asc
+
+    # Per-bucket offset within the global sorted array.
+    ones        = torch.ones(N, device=device, dtype=dtype)
+    total_count = torch.zeros(n_grp_total, device=device, dtype=dtype).scatter_add_(0, gid_global, ones)
+    offsets     = (total_count.cumsum(0) - total_count).long()    # (n_grp_total,)
+
+    vc        = counts.long()                                     # valid count per bucket
+    vc_minus  = (vc - 1).clamp(min=0)
+    q1_w      = (vc // 4).clamp(max=vc_minus)
+    med_w     = (vc // 2).clamp(max=vc_minus)
+    q3_w      = ((3 * vc) // 4).clamp(max=vc_minus)
+
+    q1_idx  = (offsets + q1_w).clamp(min=0, max=N - 1)
+    med_idx = (offsets + med_w).clamp(min=0, max=N - 1)
+    q3_idx  = (offsets + q3_w).clamp(min=0, max=N - 1)
+
+    grp_loc = values_sorted[med_idx]                              # (n_grp_total,)
+    grp_q1  = values_sorted[q1_idx]
+    grp_q3  = values_sorted[q3_idx]
+
+    iqr       = (grp_q3 - grp_q1).clamp(min=1e-8)
+    grp_scale = iqr / 1.349                                       # ≈ std under normal
+
+    return grp_loc, grp_scale
+
+
+# ---------------------------------------------------------------------------
 # Core reweighting: pure within-group z-score → linear perturbation c_t.
 # ---------------------------------------------------------------------------
 
@@ -105,7 +174,8 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_inst,
                                gamma, min_group_size=4, apply_perturbation=True,
                                use_bidir_norm=False, use_softmax_norm=False,
-                               n_feasible=None, low_grp_mean_thresh=0.0):
+                               n_feasible=None, low_grp_mean_thresh=0.0,
+                               use_robust_norm=False):
     """
     entropy:           (B, P, T) — model entropy at each step
     valid_mask:        (B, P, T) bool — True = real decision step
@@ -180,12 +250,23 @@ def compute_entropy_z_weights(entropy, valid_mask, advantage, gid, n_grp_per_ins
 
     # ── Group statistics over entropy (valid steps only). ─────────────────────
     counts = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, v_flat)
-    sums   = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, ent_flat * v_flat)
-    grp_mean = (sums / counts.clamp(min=1))[gid_global]
 
-    centered = (ent_flat - grp_mean) * v_flat
-    sq_sums  = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, centered.square())
-    grp_std  = ((sq_sums / counts.clamp(min=1)).sqrt().clamp(min=1e-8))[gid_global]
+    if use_robust_norm:
+        # Robust: median + IQR/1.349 per bucket (outlier-resistant).
+        grp_loc_per_g, grp_scale_per_g = _segmented_median_iqr(
+            ent_flat, v_flat, gid_global, n_grp_total, counts)
+        grp_mean = grp_loc_per_g[gid_global]                          # per-step median
+        grp_std  = grp_scale_per_g[gid_global].clamp(min=1e-8)        # per-step IQR/1.349
+        # sq_sums is needed downstream only for R²_grp diagnostic; compute it
+        # using residual to robust center so R² is computable consistently.
+        centered = (ent_flat - grp_mean) * v_flat
+        sq_sums  = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, centered.square())
+    else:
+        sums   = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, ent_flat * v_flat)
+        grp_mean = (sums / counts.clamp(min=1))[gid_global]
+        centered = (ent_flat - grp_mean) * v_flat
+        sq_sums  = torch.zeros(n_grp_total, device=device).scatter_add_(0, gid_global, centered.square())
+        grp_std  = ((sq_sums / counts.clamp(min=1)).sqrt().clamp(min=1e-8))[gid_global]
 
     delta_H = (ent_flat - grp_mean) / grp_std                        # (B·P·T,)
 

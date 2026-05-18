@@ -42,6 +42,9 @@ _parser.add_argument('--monoseg', type=str, default=None, choices=['on', 'off'],
 _parser.add_argument('--postbucket', type=str, default=None, choices=['on', 'off'],
                      help='only with --monoseg on: subtract bucket-mean of '
                           'ΔH_local within (n_feasible, at_depot, load_bin).')
+_parser.add_argument('--robust', type=str, default=None, choices=['on', 'off'],
+                     help='use median+IQR/1.349 instead of mean+std for bucket '
+                          'normalization. Outlier-robust on small buckets.')
 _parser.add_argument('--seed', type=int, default=None,
                      help='random seed for torch/numpy/random (None = no seeding, '
                           'CUDA non-deterministic). Run name gets -s{seed} suffix.')
@@ -73,6 +76,8 @@ if _args.monoseg is not None:
     _HP.USE_MONOSEG_BASELINE = (_args.monoseg == 'on')
 if _args.postbucket is not None:
     _HP.USE_MONOSEG_POSTBUCKET = (_args.postbucket == 'on')
+if _args.robust is not None:
+    _HP.USE_ROBUST_NORM = (_args.robust == 'on')
 
 from HYPER_PARAMS import *
 
@@ -92,6 +97,8 @@ if USE_ENTROPY_REWEIGHT:
             _tag += "-noVR"
         if LOW_GRP_MEAN_THRESH > 0.0:
             _tag += "-Lm{}".format(LOW_GRP_MEAN_THRESH)
+        if USE_ROBUST_NORM:
+            _tag += "-RN"
 if USE_ENTROPY_BONUS:
     _tag += "-Bonus_b{}".format(ENTROPY_BONUS_BETA)
 if _args.seed is not None:

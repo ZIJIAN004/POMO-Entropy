@@ -278,6 +278,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     use_softmax_norm=USE_SOFTMAX_NORM,
                     n_feasible=n_feasible_list,
                     low_grp_mean_thresh=LOW_GRP_MEAN_THRESH,
+                    use_robust_norm=USE_ROBUST_NORM,
                 )
                 log_prob = (prob_list.log() * weights).sum(dim=2)
 
