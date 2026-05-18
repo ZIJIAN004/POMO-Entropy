@@ -431,14 +431,6 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     omega_AM.result()  if (omega_AM  is not None and omega_AM.count  > 0) else float('nan'),
                     ctCV_AM.result()   if (ctCV_AM   is not None and ctCV_AM.count   > 0) else float('nan'),
                     sigRat_AM.result() if (sigRat_AM is not None and sigRat_AM.count > 0) else float('nan'))
-                if corrH_AM is not None and corrH_AM.count > 0:
-                    cH = corrH_AM.result()
-                    cL = corrL_AM.result() if corrL_AM.count > 0 else float('nan')
-                    gmMed = gmMed_AM.result() if gmMed_AM.count > 0 else float('nan')
-                    lowG = lowGrp_AM.result() if lowGrp_AM.count > 0 else float('nan')
-                    asnr = asnr_AM.result() if asnr_AM.count > 0 else float('nan')
-                    extra += "  H1: corr(hiG/loG)={:+.4f}/{:+.4f}  gm_med={:.3f}  lowG(<.05)={:.2f}  |A|/σ_A={:.3f}".format(
-                        cH, cL, gmMed, lowG, asnr)
             logger.info('Ep:{:03d}-{:07d}({:5.1f}%)  T:{}  Loss:{:+.4f}  Avg.best_dist:{:.4f}{}'.format(
                 epoch, episode, 100. * episode / TRAIN_EPISODES,
                 elapsed, loss_AM.result(), score_AM.result(), extra))
