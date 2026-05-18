@@ -127,6 +127,15 @@ USE_MONOSEG_POSTBUCKET   = False
 # bucket. Only effective on the bucket path (not monoseg). Default False.
 USE_ROBUST_NORM          = False
 
+# Confidence signal: which scalar to use as "model uncertainty/confidence"
+# in place of entropy. Options:
+#   'entropy' (default) — H = -Σ p log p; coupled to log(n_feasible)
+#   'margin'            — prob_margin = p(top-1) − p(top-2); scale-free [0,1].
+#                         Larger margin = model is decisive on top-1.
+# Bucket path uses this signal in place of entropy for grp_mean/grp_std.
+# Monoseg path uses this signal in place of H for anchor/ΔH_local.
+CONFIDENCE_SIGNAL        = 'entropy'
+
 # ===========================================================================
 # Entropy Regularization Bonus (A2C/PPO-style — independent path)
 #   loss = policy_loss - ENTROPY_BONUS_BETA * mean(entropy)

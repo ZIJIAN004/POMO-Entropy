@@ -57,11 +57,13 @@ class VRPTWModel(nn.Module):
             selected = torch.zeros(batch_size, pomo_size, dtype=torch.long, device=dev)
             prob     = torch.ones(batch_size, pomo_size, device=dev)
             entropy  = torch.zeros(batch_size, pomo_size, device=dev)
+            margin   = torch.zeros(batch_size, pomo_size, device=dev)
 
         elif state.selected_count == 1:
             selected = torch.arange(1, pomo_size + 1, device=dev)[None, :].expand(batch_size, -1)
             prob     = torch.ones(batch_size, pomo_size, device=dev)
             entropy  = torch.zeros(batch_size, pomo_size, device=dev)
+            margin   = torch.zeros(batch_size, pomo_size, device=dev)
 
         else:
             enc_last = get_encoding(self.encoded_nodes, state.current_node)
@@ -74,6 +76,8 @@ class VRPTWModel(nn.Module):
             probs     = F.softmax(score, dim=2)
 
             entropy  = -(probs * probs.clamp(min=1e-20).log()).sum(dim=2)
+            top2     = probs.topk(2, dim=2).values
+            margin   = top2[..., 0] - top2[..., 1]
 
             if self.training:
                 while True:
@@ -87,4 +91,4 @@ class VRPTWModel(nn.Module):
                 selected = probs.argmax(dim=2)
                 prob     = None
 
-        return selected, prob, entropy
+        return selected, prob, entropy, margin

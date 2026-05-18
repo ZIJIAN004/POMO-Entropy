@@ -39,7 +39,8 @@ import torch
 from HYPER_PARAMS import *
 from source.utilities import Average_Meter
 from source.baseline import (build_group_id, compute_entropy_z_weights,
-                              compute_monoseg_weights)
+                              compute_monoseg_weights,
+                              ols_r2_per_instance)
 
 
 def _make_valid_mask(T_total, batch_size, device, finished_list=None):
@@ -83,6 +84,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
     ctTop3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # softmax c_t top-3 concentration
     pbAbs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: |bucket_mean ΔH|
     pbAct_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: fraction of rw with sufficient bucket
+    r2f2_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # OLS R² with F2 features (main only)
+    r2f5_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # OLS R² with F5 (F2 + interactions + sq + cubes)
 
     logger_start = time.time()
     episode      = 0
@@ -131,11 +134,19 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
         state, reward, done = env.pre_step()
 
         while not done:
-            selected, prob, entropy = model(state)
+            selected, prob, entropy, margin = model(state)
+
+            # Pick which scalar to use as "confidence signal" for reweight.
+            if CONFIDENCE_SIGNAL == 'margin':
+                signal = margin
+            else:
+                signal = entropy
 
             if collect_groups:
+                # entropy_list keeps its name for backward compatibility, but
+                # may now hold prob margin depending on CONFIDENCE_SIGNAL.
                 entropy_list = torch.cat(
-                    (entropy_list, entropy[:, :, None]), dim=2)
+                    (entropy_list, signal[:, :, None]), dim=2)
                 n_feasible_list = torch.cat(
                     (n_feasible_list, state.n_feasible[:, :, None].float()), dim=2)
 
@@ -326,6 +337,39 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     A_snr = (advantage.abs() /
                              advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
                     asnr_AM.push(A_snr.unsqueeze(0))
+
+            # ── OLS R² diagnostic (shared between monoseg and bucket paths) ─
+            # Fits per-instance OLS predicting the confidence signal from the
+            # 4 candidate environment features. F2 = main only, F5 = + pairwise
+            # interactions + squares + cubes. High R² = features explain the
+            # signal → bucket framework has a chance. Low R² = signal is
+            # high-dim function of state, bucket framework fundamentally weak.
+            with torch.no_grad():
+                if PROBLEM_TYPE == 'tsp':
+                    feats_main = (n_feasible_list / float(POMO_SIZE)).unsqueeze(-1)
+                elif PROBLEM_TYPE == 'cvrp':
+                    feats_main = torch.stack([
+                        n_feasible_list / float(POMO_SIZE),
+                        at_depot_list,
+                        load_list,
+                        vis_ratio_list,
+                    ], dim=-1)
+                else:   # vrptw
+                    feats_main = torch.stack([
+                        n_feasible_list / float(POMO_SIZE),
+                        at_depot_list,
+                        time_list,
+                        vis_ratio_list,
+                    ], dim=-1)
+
+                r2_f2 = ols_r2_per_instance(entropy_list, valid, feats_main,
+                                             include_extras=False)
+                r2_f5 = ols_r2_per_instance(entropy_list, valid, feats_main,
+                                             include_extras=True)
+                if r2f2_AM is not None:
+                    r2f2_AM.push(r2_f2.unsqueeze(0))
+                if r2f5_AM is not None:
+                    r2f5_AM.push(r2_f5.unsqueeze(0))
         else:
             log_prob = prob_list.log().sum(dim=2)
 
@@ -367,6 +411,11 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                 extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f} R²={:.3f}".format(
                     phase, top3_AM.result(), small_AM.result(), rw_AM.result(),
                     r2_AM.result() if r2_AM.count > 0 else float('nan'))
+            # OLS R² diagnostic (appended to whichever mode log line was built)
+            if r2f2_AM is not None and r2f2_AM.count > 0:
+                extra += "  OLS: F2={:.3f}  F5={:.3f}".format(
+                    r2f2_AM.result(),
+                    r2f5_AM.result() if r2f5_AM.count > 0 else float('nan'))
                 if corrH_AM is not None and corrH_AM.count > 0:
                     cH = corrH_AM.result()
                     cL = corrL_AM.result() if corrL_AM.count > 0 else float('nan')

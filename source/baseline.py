@@ -111,6 +111,74 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 # Complexity: O(N log N) via the single sort, plus O(n_grp_total) scatters.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# OLS R² diagnostic: per-instance batched OLS, returns mean R² across B.
+# Two feature sets:
+#   F2 — main effects only (the 4 features we use for bucket: n_f, at_depot,
+#        load/time, vis_ratio)
+#   F5 — F2 + pairwise interactions + squares + cubes
+# If F5 R² ≫ F2 R², high-order terms help. If both small, the 4 features
+# fundamentally can't explain the signal (justifies giving up bucket path).
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True):
+    """
+    signal:        (B, P, T) float — y variable (entropy or margin)
+    valid_mask:    (B, P, T) bool/float — fit only on valid rows
+    features_main: (B, P, T, K_main) float — main effects
+    include_extras: bool — add pairwise interactions + squares + cubes if True
+
+    Returns: r2 (scalar) — mean R² across the B instances (clamped to ≥ -2)
+    """
+    B, P, T, K_main = features_main.shape
+    N = P * T
+    device = features_main.device
+    dtype  = features_main.dtype
+
+    f = features_main.reshape(B, N, K_main)
+
+    if include_extras and K_main > 1:
+        # pairwise products i<j
+        i_idx, j_idx = torch.triu_indices(K_main, K_main, offset=1)
+        pair_term = f[:, :, i_idx] * f[:, :, j_idx]                 # (B, N, K_main*(K_main-1)/2)
+        sq_term   = f * f                                            # (B, N, K_main)
+        cube_term = f * sq_term                                      # (B, N, K_main)
+        X = torch.cat([f, pair_term, sq_term, cube_term], dim=-1)
+    elif include_extras and K_main == 1:
+        sq_term   = f * f
+        cube_term = f * sq_term
+        X = torch.cat([f, sq_term, cube_term], dim=-1)
+    else:
+        X = f
+
+    # Add intercept
+    ones = torch.ones(B, N, 1, device=device, dtype=dtype)
+    X = torch.cat([ones, X], dim=-1)                                 # (B, N, K+1)
+
+    y    = signal.reshape(B, N, 1)
+    mask = valid_mask.float().reshape(B, N, 1) if valid_mask.dtype == torch.bool else valid_mask.reshape(B, N, 1)
+
+    # Weighted least squares via row zero-out (mask binary):
+    # min Σ_i (m_i · (y_i − X_i β))² = Σ_{valid} (y_i − X_i β)² — same minimizer.
+    Xm = X * mask
+    ym = y * mask
+
+    sol   = torch.linalg.lstsq(Xm, ym).solution                      # (B, K+1, 1)
+    y_hat = (Xm @ sol).squeeze(-1)                                   # (B, N)
+
+    y_t = y.squeeze(-1)
+    m_t = mask.squeeze(-1)
+    n_v = m_t.sum(dim=1).clamp(min=1.0)
+    y_mean = (y_t * m_t).sum(dim=1) / n_v                            # (B,)
+
+    ss_tot = (((y_t - y_mean[:, None]) ** 2) * m_t).sum(dim=1)
+    ss_res = (((y_t - y_hat) ** 2) * m_t).sum(dim=1)
+    r2_per = (1.0 - ss_res / ss_tot.clamp(min=1e-8)).clamp(min=-2.0, max=1.0)
+
+    return r2_per.mean()
+
+
 @torch.no_grad()
 def _segmented_median_iqr(values_flat, valid_mask_flat, gid_global,
                            n_grp_total, counts):

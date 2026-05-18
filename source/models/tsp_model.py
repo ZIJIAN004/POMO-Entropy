@@ -49,6 +49,7 @@ class TSPModel(nn.Module):
             selected = torch.arange(pomo_size, device=dev)[None, :].expand(batch_size, -1)
             prob = torch.ones(batch_size, pomo_size, device=dev)
             entropy = torch.zeros(batch_size, pomo_size, device=dev)
+            margin  = torch.zeros(batch_size, pomo_size, device=dev)
             self.first_node = selected
         else:
             enc_first = get_encoding(self.encoded_nodes, self.first_node)
@@ -63,6 +64,8 @@ class TSPModel(nn.Module):
             probs  = F.softmax(score, dim=2)
 
             entropy = -(probs * probs.clamp(min=1e-20).log()).sum(dim=2)
+            top2    = probs.topk(2, dim=2).values
+            margin  = top2[..., 0] - top2[..., 1]
 
             if self.training:
                 while True:
@@ -76,4 +79,4 @@ class TSPModel(nn.Module):
                 selected = probs.argmax(dim=2)
                 prob = None
 
-        return selected, prob, entropy
+        return selected, prob, entropy, margin

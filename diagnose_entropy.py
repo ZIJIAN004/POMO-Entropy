@@ -108,7 +108,7 @@ with torch.no_grad():
 
         state, _, done = env.pre_step()
         while not done:
-            selected, _, entropy = model(state)
+            selected, _, entropy, *_ = model(state)
             H_list  = torch.cat((H_list,  entropy[:, :, None]),                dim=2)
             nf_list = torch.cat((nf_list, state.n_feasible[:, :, None].float()), dim=2)
             if fin_list is not None:

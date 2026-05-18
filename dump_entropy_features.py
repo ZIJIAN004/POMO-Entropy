@@ -149,7 +149,7 @@ def _rollout_one_batch(args, env, model, device, bi, records):
         feats = (_features_tsp(state, B, P, device, ctx) if args.problem == 'tsp'
                  else _features_cvrp(state, env, B, P, device, ctx))
 
-        selected, _, entropy = model(state)
+        selected, _, entropy, *_ = model(state)
 
         forced = 1 if args.problem == 'tsp' else 2
         valid = torch.ones(B, P, dtype=torch.bool, device=device)
