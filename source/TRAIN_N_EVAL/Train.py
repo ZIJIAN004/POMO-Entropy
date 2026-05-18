@@ -240,11 +240,12 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     asnr_AM.push(A_snr.unsqueeze(0))
             else:
                 # USE_VIS_RATIO_BIN=False → 3-dim bucket (drop vis_ratio).
-                vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
+                # vis_ratio_list only exists on CVRP/VRPTW (TSP doesn't collect it).
                 if PROBLEM_TYPE == 'tsp':
                     gid, n_grp = build_group_id(
                         'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
                 elif PROBLEM_TYPE == 'cvrp':
+                    vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
                     gid, n_grp = build_group_id(
                         'cvrp',
                         n_feasible=n_feasible_list,
@@ -254,6 +255,7 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                         n_bins=ENTROPY_N_BINS,
                     )
                 else:  # vrptw
+                    vis_arg = vis_ratio_list if USE_VIS_RATIO_BIN else None
                     gid, n_grp = build_group_id(
                         'vrptw',
                         n_feasible=n_feasible_list,
