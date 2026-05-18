@@ -122,14 +122,18 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True):
+def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True,
+                        ridge=1e-4):
     """
     signal:        (B, P, T) float — y variable (entropy or margin)
     valid_mask:    (B, P, T) bool/float — fit only on valid rows
     features_main: (B, P, T, K_main) float — main effects
     include_extras: bool — add pairwise interactions + squares + cubes if True
+    ridge:         small L2 reg on β to keep (X^T X) invertible even when
+                   include_extras introduces rank-deficiency (e.g. binary
+                   at_depot has ad² = ad³ = ad → 3 redundant columns).
 
-    Returns: r2 (scalar) — mean R² across the B instances (clamped to ≥ -2)
+    Returns: r2 (scalar) — mean R² across the B instances (clamped to [0, 1])
     """
     B, P, T, K_main = features_main.shape
     N = P * T
@@ -155,16 +159,23 @@ def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True):
     # Add intercept
     ones = torch.ones(B, N, 1, device=device, dtype=dtype)
     X = torch.cat([ones, X], dim=-1)                                 # (B, N, K+1)
+    K_total = X.shape[-1]
 
     y    = signal.reshape(B, N, 1)
     mask = valid_mask.float().reshape(B, N, 1) if valid_mask.dtype == torch.bool else valid_mask.reshape(B, N, 1)
 
-    # Weighted least squares via row zero-out (mask binary):
-    # min Σ_i (m_i · (y_i − X_i β))² = Σ_{valid} (y_i − X_i β)² — same minimizer.
+    # Weighted least squares via row zero-out (binary mask):
+    # min Σ_i (m_i · (y_i − X_i β))² = Σ_{valid} (y_i − X_i β)²
     Xm = X * mask
     ym = y * mask
 
-    sol   = torch.linalg.lstsq(Xm, ym).solution                      # (B, K+1, 1)
+    # Ridge-regularized normal equations:  β = (XᵀX + λI)⁻¹ Xᵀy
+    # Avoids lstsq's GPU 'gels' driver instability on rank-deficient X
+    # (e.g. binary feature's high powers are colinear with itself).
+    XtX = Xm.transpose(-1, -2) @ Xm                                  # (B, K, K)
+    Xty = Xm.transpose(-1, -2) @ ym                                  # (B, K, 1)
+    I = torch.eye(K_total, device=device, dtype=dtype).unsqueeze(0)  # (1, K, K)
+    sol   = torch.linalg.solve(XtX + ridge * I, Xty)                 # (B, K, 1)
     y_hat = (Xm @ sol).squeeze(-1)                                   # (B, N)
 
     y_t = y.squeeze(-1)
@@ -174,7 +185,7 @@ def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True):
 
     ss_tot = (((y_t - y_mean[:, None]) ** 2) * m_t).sum(dim=1)
     ss_res = (((y_t - y_hat) ** 2) * m_t).sum(dim=1)
-    r2_per = (1.0 - ss_res / ss_tot.clamp(min=1e-8)).clamp(min=-2.0, max=1.0)
+    r2_per = (1.0 - ss_res / ss_tot.clamp(min=1e-8)).clamp(min=0.0, max=1.0)
 
     return r2_per.mean()
 
