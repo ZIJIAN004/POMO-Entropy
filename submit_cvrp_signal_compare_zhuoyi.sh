@@ -11,7 +11,7 @@
 #   cd /homes/zhuoyi/zijianliu/POMO-Entropy
 #   sbatch submit_cvrp_signal_compare_zhuoyi.sh
 # ============================================================================
-#SBATCH --qos long
+#SBATCH --qos normal
 #SBATCH --gpus=2
 #SBATCH --job-name=cvrp_signal_cmp
 #SBATCH --output=/homes/zhuoyi/zijianliu/POMO-Entropy/logs/cvrp_signal_cmp_%j.log
