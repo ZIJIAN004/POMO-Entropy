@@ -38,6 +38,7 @@ Pipeline (per call):
 """
 
 import torch
+import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
@@ -112,82 +113,120 @@ def build_group_id(problem_type, *, n_feasible, at_depot=None, load=None,
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# OLS R² diagnostic: per-instance batched OLS, returns mean R² across B.
-# Two feature sets:
-#   F2 — main effects only (the 4 features we use for bucket: n_f, at_depot,
-#        load/time, vis_ratio)
-#   F5 — F2 + pairwise interactions + squares + cubes
-# If F5 R² ≫ F2 R², high-order terms help. If both small, the 4 features
-# fundamentally can't explain the signal (justifies giving up bucket path).
+# H1-H4 diagnostic suite (replaces OLS R² which was train-set-only and
+# feature-form-dependent — not a clean objective measure).
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def ols_r2_per_instance(signal, valid_mask, features_main, include_extras=True,
-                        ridge=1e-4):
+def anova_omega_squared(signal_flat, valid_flat, gid_global, n_grp_total):
     """
-    signal:        (B, P, T) float — y variable (entropy or margin)
-    valid_mask:    (B, P, T) bool/float — fit only on valid rows
-    features_main: (B, P, T, K_main) float — main effects
-    include_extras: bool — add pairwise interactions + squares + cubes if True
-    ridge:         small L2 reg on β to keep (X^T X) invertible even when
-                   include_extras introduces rank-deficiency (e.g. binary
-                   at_depot has ad² = ad³ = ad → 3 redundant columns).
+    H2 diagnostic — objective measure of "how good is this bucketing".
 
-    Returns: r2 (scalar) — mean R² across the B instances (clamped to [0, 1])
+    ω² = (SS_between − (K−1)·MS_within) / (SS_total + MS_within)
+
+    Bias-corrected effect size for one-way ANOVA. Unlike R² it does NOT
+    auto-inflate with K (more buckets), so 4-dim vs 3-dim is directly
+    comparable. Cohen's rule of thumb: < 0.01 negligible, 0.01–0.06 small,
+    0.06–0.14 medium, > 0.14 large.
+
+    signal_flat:   (N,) float — entropy or margin, flat
+    valid_flat:    (N,) float — 1.0 valid, 0.0 invalid
+    gid_global:    (N,) long  — bucket id with batch offset
+    n_grp_total:   int        — total # of unique gids (B · n_grp_per_inst)
+
+    Returns: (omega_sq, n_eff_groups) — both scalar tensors
     """
-    B, P, T, K_main = features_main.shape
-    N = P * T
-    device = features_main.device
-    dtype  = features_main.dtype
+    device = signal_flat.device
+    dtype  = signal_flat.dtype
 
-    f = features_main.reshape(B, N, K_main)
+    counts = torch.zeros(n_grp_total, device=device, dtype=dtype).scatter_add_(0, gid_global, valid_flat)
+    sums   = torch.zeros(n_grp_total, device=device, dtype=dtype).scatter_add_(0, gid_global, signal_flat * valid_flat)
+    grp_mean_per_g = sums / counts.clamp(min=1.0)
 
-    if include_extras and K_main > 1:
-        # pairwise products i<j
-        i_idx, j_idx = torch.triu_indices(K_main, K_main, offset=1)
-        pair_term = f[:, :, i_idx] * f[:, :, j_idx]                 # (B, N, K_main*(K_main-1)/2)
-        sq_term   = f * f                                            # (B, N, K_main)
-        cube_term = f * sq_term                                      # (B, N, K_main)
-        X = torch.cat([f, pair_term, sq_term, cube_term], dim=-1)
-    elif include_extras and K_main == 1:
-        sq_term   = f * f
-        cube_term = f * sq_term
-        X = torch.cat([f, sq_term, cube_term], dim=-1)
-    else:
-        X = f
+    grp_mean_step = grp_mean_per_g[gid_global]
+    centered = (signal_flat - grp_mean_step) * valid_flat
+    ss_within = centered.square().sum()
 
-    # Add intercept
-    ones = torch.ones(B, N, 1, device=device, dtype=dtype)
-    X = torch.cat([ones, X], dim=-1)                                 # (B, N, K+1)
-    K_total = X.shape[-1]
+    n_total = valid_flat.sum().clamp(min=1.0)
+    global_mean = (signal_flat * valid_flat).sum() / n_total
+    diff_g = (signal_flat - global_mean) * valid_flat
+    ss_total = diff_g.square().sum()
 
-    y    = signal.reshape(B, N, 1)
-    mask = valid_mask.float().reshape(B, N, 1) if valid_mask.dtype == torch.bool else valid_mask.reshape(B, N, 1)
+    ss_between = (ss_total - ss_within).clamp(min=0.0)
 
-    # Weighted least squares via row zero-out (binary mask):
-    # min Σ_i (m_i · (y_i − X_i β))² = Σ_{valid} (y_i − X_i β)²
-    Xm = X * mask
-    ym = y * mask
+    n_eff_groups = (counts > 0.5).sum().clamp(min=torch.tensor(1.0, device=device))
+    df_within = (n_total - n_eff_groups).clamp(min=1.0)
+    ms_within = ss_within / df_within
 
-    # Ridge-regularized normal equations:  β = (XᵀX + λI)⁻¹ Xᵀy
-    # Avoids lstsq's GPU 'gels' driver instability on rank-deficient X
-    # (e.g. binary feature's high powers are colinear with itself).
-    XtX = Xm.transpose(-1, -2) @ Xm                                  # (B, K, K)
-    Xty = Xm.transpose(-1, -2) @ ym                                  # (B, K, 1)
-    I = torch.eye(K_total, device=device, dtype=dtype).unsqueeze(0)  # (1, K, K)
-    sol   = torch.linalg.solve(XtX + ridge * I, Xty)                 # (B, K, 1)
-    y_hat = (Xm @ sol).squeeze(-1)                                   # (B, N)
+    omega_sq = ((ss_between - (n_eff_groups - 1) * ms_within) /
+                (ss_total + ms_within).clamp(min=1e-8)).clamp(min=-1.0, max=1.0)
+    return omega_sq, n_eff_groups.to(dtype)
 
-    y_t = y.squeeze(-1)
-    m_t = mask.squeeze(-1)
-    n_v = m_t.sum(dim=1).clamp(min=1.0)
-    y_mean = (y_t * m_t).sum(dim=1) / n_v                            # (B,)
 
-    ss_tot = (((y_t - y_mean[:, None]) ** 2) * m_t).sum(dim=1)
-    ss_res = (((y_t - y_hat) ** 2) * m_t).sum(dim=1)
-    r2_per = (1.0 - ss_res / ss_tot.clamp(min=1e-8)).clamp(min=0.0, max=1.0)
+class MLPSignalEstimator(nn.Module):
+    """
+    H1 diagnostic — non-linear upper bound on "how much of the signal is
+    state-predictable". If even this MLP can't fit signal | state above
+    some threshold, the signal itself has little state-predictable
+    structure → step-level reweight has no leverage regardless of method.
 
-    return r2_per.mean()
+    Persistent across batches: maintained alongside the main model, slow
+    updated on each batch's data (split 50/50 into fit/holdout, fit ~5
+    grad steps, return held-out R²). After many batches it converges
+    to the true conditional E[signal | state] within MLP capacity.
+    """
+    def __init__(self, in_dim, hidden=64, depth=3, lr=1e-3):
+        super().__init__()
+        layers = [nn.Linear(in_dim, hidden), nn.ReLU()]
+        for _ in range(max(0, depth - 2)):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+        layers.append(nn.Linear(hidden, 1))
+        self.net = nn.Sequential(*layers)
+        self.opt = torch.optim.Adam(self.parameters(), lr=lr)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+    def step_and_eval(self, features_flat, signal_flat, valid_flat,
+                       n_inner_steps=5):
+        """
+        features_flat: (N, in_dim) — detached from main computation graph
+        signal_flat:   (N,)        — detached
+        valid_flat:    (N,) float
+        Returns: held-out R² (scalar)
+        """
+        # Detach to avoid leaking grad into the main model.
+        features_flat = features_flat.detach()
+        signal_flat   = signal_flat.detach()
+        valid_flat    = valid_flat.detach()
+
+        device = features_flat.device
+        valid_idx = (valid_flat > 0.5).nonzero(as_tuple=True)[0]
+        if valid_idx.numel() < 20:
+            return torch.tensor(0.0, device=device)
+        perm = valid_idx[torch.randperm(valid_idx.numel(), device=device)]
+        n_fit = perm.numel() // 2
+        fit_idx, hold_idx = perm[:n_fit], perm[n_fit:]
+
+        # ── Fit step(s) — needs grad even if caller wrapped us in no_grad ──
+        x_fit, y_fit = features_flat[fit_idx], signal_flat[fit_idx]
+        with torch.enable_grad():
+            for _ in range(n_inner_steps):
+                pred = self(x_fit)
+                loss = (pred - y_fit).square().mean()
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+
+        # ── Held-out R² ──
+        with torch.no_grad():
+            x_h, y_h = features_flat[hold_idx], signal_flat[hold_idx]
+            pred_h = self(x_h)
+            y_mean = y_h.mean()
+            ss_tot = (y_h - y_mean).square().sum()
+            ss_res = (y_h - pred_h).square().sum()
+            r2 = (1.0 - ss_res / ss_tot.clamp(min=1e-8)).clamp(min=-1.0, max=1.0)
+        return r2
 
 
 @torch.no_grad()

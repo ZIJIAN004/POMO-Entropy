@@ -40,7 +40,13 @@ from HYPER_PARAMS import *
 from source.utilities import Average_Meter
 from source.baseline import (build_group_id, compute_entropy_z_weights,
                               compute_monoseg_weights,
-                              ols_r2_per_instance)
+                              anova_omega_squared, MLPSignalEstimator)
+
+
+# Persistent MLP estimator across batches and epochs (one per process).
+# Created lazily on first batch since we need feature dim from runtime.
+_MLP_ESTIMATOR = None
+_MLP_DEVICE = None
 
 
 def _make_valid_mask(T_total, batch_size, device, finished_list=None):
@@ -61,31 +67,19 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
 
     score_AM = Average_Meter()
     loss_AM  = Average_Meter()
-    top3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None
-    small_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None
-    rw_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None
-    r2_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None   # bucket R² — partition quality
-    # H1 diagnostic: corr(ΔH, A) on rw steps, partitioned by GROUP grp_mean.
-    # Reweighting operates per-group (grp_mean/grp_std shared by all steps in
-    # a bucket), so the right partitioning unit is the group, not the step.
-    # Hypothesis: if low-grp_mean groups carry misallocated credit, corr in
-    # low-grp half ≪ corr in high-grp half.
-    corrH_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in high-grp_mean groups
-    corrL_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in low-grp_mean groups
-    asnr_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # |A|/σ_A — H2 probe
-    gmMed_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # median grp_mean among rw steps
-    lowGrp_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw steps in groups with grp_mean<0.05
-
-    # ── Monoseg-mode diagnostics (only used when USE_MONOSEG_BASELINE) ──────
-    nsegs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean segments per traj
-    seglen_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean segment length
-    dPos_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on rising-seg steps
-    dNeg_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # mean ΔH on falling-seg steps
-    ctTop3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # softmax c_t top-3 concentration
-    pbAbs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: |bucket_mean ΔH|
-    pbAct_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # postbucket: fraction of rw with sufficient bucket
-    r2f2_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # OLS R² with F2 features (main only)
-    r2f5_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # OLS R² with F5 (F2 + interactions + sq + cubes)
+    # ── Kept (pipeline-health) ──────────────────────────────────────────────
+    top3_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # bucket size concentration
+    rw_AM      = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # rw_mask coverage
+    ctTop3_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # c_t softmax concentration
+    # ── New H1-H4 diagnostics ───────────────────────────────────────────────
+    omega_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # H2 — bucket ANOVA ω²
+    mlpR2_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # H1 — MLP held-out R² (signal upper bound)
+    lagCorr_AM = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # H1 — corr(H_t, H_{t-1}) lag-1 autocorrelation
+    ctCV_AM    = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # H3 — c_t coefficient of variation
+    sigRat_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # H4 — σ²_traj / σ²_step (signal granularity)
+    # ── Monoseg-only extras kept for backward compat ────────────────────────
+    nsegs_AM   = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # monoseg
+    seglen_AM  = Average_Meter() if USE_ENTROPY_REWEIGHT else None  # monoseg
 
     logger_start = time.time()
     episode      = 0
@@ -235,20 +229,8 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
                     nsegs_AM.push(diag['n_segs_per_traj'].unsqueeze(0))
                 if seglen_AM is not None:
                     seglen_AM.push(diag['seg_len_mean'].unsqueeze(0))
-                if dPos_AM is not None:
-                    dPos_AM.push(diag['delta_pos_mean'].unsqueeze(0))
-                if dNeg_AM is not None:
-                    dNeg_AM.push(diag['delta_neg_mean'].unsqueeze(0))
                 if ctTop3_AM is not None:
                     ctTop3_AM.push(diag['ct_top3'].unsqueeze(0))
-                if USE_MONOSEG_POSTBUCKET and pbAbs_AM is not None:
-                    pbAbs_AM.push(diag['pb_mean_abs'].unsqueeze(0))
-                    pbAct_AM.push(diag['pb_active_frac'].unsqueeze(0))
-
-                with torch.no_grad():
-                    A_snr = (advantage.abs() /
-                             advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
-                    asnr_AM.push(A_snr.unsqueeze(0))
             else:
                 # USE_VIS_RATIO_BIN=False → 3-dim bucket (drop vis_ratio).
                 # vis_ratio_list only exists on CVRP/VRPTW (TSP doesn't collect it).
@@ -295,81 +277,119 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
 
                 if top3_AM is not None:
                     top3_AM.push(diag['top3_concentration'].unsqueeze(0))
-                if small_AM is not None:
-                    small_AM.push(diag['small_group_ratio'].unsqueeze(0))
                 if rw_AM is not None:
                     rw_AM.push(diag['rw_ratio'].unsqueeze(0))
-                if r2_AM is not None:
-                    r2_AM.push(diag['r2_grp'].unsqueeze(0))
 
-                # ── H1 diagnostic (TSP-vs-CVRP comparison) ─────────────────
-                # Partition rw steps by their GROUP's grp_mean (median split).
+                # c_t concentration (H3 in bucket path — top-3 c_t share per traj)
                 with torch.no_grad():
-                    dH    = diag['delta_H']             # (B, P, T)
-                    rwm   = diag['rw_mask']             # (B, P, T) bool
-                    gm    = diag['grp_mean']            # (B, P, T)
-                    A_exp = advantage.unsqueeze(2).expand_as(dH)
+                    rwm_f = diag['rw_mask'].float()
+                    w_rw_only = weights * rwm_f
+                    T_rw_per = rwm_f.sum(dim=2).clamp(min=1.0)               # (B, P)
+                    ct_top3_per = w_rw_only.topk(min(3, w_rw_only.size(2)), dim=2).values.sum(dim=2)
+                    ct_top3 = (ct_top3_per / T_rw_per).mean()
+                    if ctTop3_AM is not None:
+                        ctTop3_AM.push(ct_top3.unsqueeze(0))
 
-                    gm_rw = gm[rwm]
-                    if gm_rw.numel() > 100:
-                        gm_thresh = gm_rw.median()
-                        high = rwm & (gm >  gm_thresh)
-                        low  = rwm & (gm <= gm_thresh)
+            # ── H1-H4 diagnostic suite (shared across monoseg/bucket paths) ─
+            # Build 4-d (CVRP/VRPTW) or 1-d (TSP) state features (normalized).
+            if PROBLEM_TYPE == 'tsp':
+                feats_main = (n_feasible_list / float(POMO_SIZE)).unsqueeze(-1)
+            elif PROBLEM_TYPE == 'cvrp':
+                feats_main = torch.stack([
+                    n_feasible_list / float(POMO_SIZE),
+                    at_depot_list, load_list, vis_ratio_list,
+                ], dim=-1)
+            else:   # vrptw
+                feats_main = torch.stack([
+                    n_feasible_list / float(POMO_SIZE),
+                    at_depot_list, time_list, vis_ratio_list,
+                ], dim=-1)
 
-                        def _pearson(mask):
-                            n = int(mask.sum())
-                            if n < 100: return None
-                            x = dH[mask]
-                            y = A_exp[mask]
-                            x = x - x.mean(); y = y - y.mean()
-                            d = (x.std() * y.std()).clamp(min=1e-8)
-                            return ((x * y).mean() / d).unsqueeze(0)
+            in_dim      = feats_main.size(-1)
+            feats_flat  = feats_main.reshape(-1, in_dim)
+            signal_flat = entropy_list.reshape(-1)        # actually carries chosen CONFIDENCE_SIGNAL
+            valid_flat  = valid.float().reshape(-1)
 
-                        c_hi = _pearson(high)
-                        c_lo = _pearson(low)
-                        if c_hi is not None: corrH_AM.push(c_hi)
-                        if c_lo is not None: corrL_AM.push(c_lo)
+            # ── H1: MLP held-out R² — signal's state-predictable upper bound.
+            # If even the MLP can't fit signal | state above ~0.1, the signal
+            # itself has little state-predictable structure → step-level
+            # reweight has no leverage regardless of method.
+            global _MLP_ESTIMATOR, _MLP_DEVICE
+            if _MLP_ESTIMATOR is None or _MLP_DEVICE != device:
+                _MLP_ESTIMATOR = MLPSignalEstimator(in_dim=in_dim).to(device)
+                _MLP_DEVICE = device
+            r2_mlp = _MLP_ESTIMATOR.step_and_eval(
+                feats_flat, signal_flat, valid_flat)
+            if mlpR2_AM is not None:
+                mlpR2_AM.push(r2_mlp.unsqueeze(0))
 
-                        gmMed_AM.push(gm_thresh.unsqueeze(0))
-                        lowGrp = (rwm & (gm < 0.05)).float().sum() / rwm.float().sum().clamp(min=1.0)
-                        lowGrp_AM.push(lowGrp.unsqueeze(0))
-
-                    A_snr = (advantage.abs() /
-                             advantage.std(dim=1, keepdim=True).clamp(min=1e-6)).mean()
-                    asnr_AM.push(A_snr.unsqueeze(0))
-
-            # ── OLS R² diagnostic (shared between monoseg and bucket paths) ─
-            # Fits per-instance OLS predicting the confidence signal from the
-            # 4 candidate environment features. F2 = main only, F5 = + pairwise
-            # interactions + squares + cubes. High R² = features explain the
-            # signal → bucket framework has a chance. Low R² = signal is
-            # high-dim function of state, bucket framework fundamentally weak.
             with torch.no_grad():
+                # ── H2: ANOVA ω² — objective bucket quality, no feature form
+                # dependence. Cohen: < 0.01 negligible, 0.06 medium, 0.14 large.
                 if PROBLEM_TYPE == 'tsp':
-                    feats_main = (n_feasible_list / float(POMO_SIZE)).unsqueeze(-1)
+                    gid_d, n_grp_d = build_group_id(
+                        'tsp', n_feasible=n_feasible_list, n_bins=ENTROPY_N_BINS)
                 elif PROBLEM_TYPE == 'cvrp':
-                    feats_main = torch.stack([
-                        n_feasible_list / float(POMO_SIZE),
-                        at_depot_list,
-                        load_list,
-                        vis_ratio_list,
-                    ], dim=-1)
-                else:   # vrptw
-                    feats_main = torch.stack([
-                        n_feasible_list / float(POMO_SIZE),
-                        at_depot_list,
-                        time_list,
-                        vis_ratio_list,
-                    ], dim=-1)
+                    gid_d, n_grp_d = build_group_id(
+                        'cvrp', n_feasible=n_feasible_list,
+                        at_depot=at_depot_list, load=load_list,
+                        vis_ratio=vis_ratio_list, n_bins=ENTROPY_N_BINS)
+                else:
+                    gid_d, n_grp_d = build_group_id(
+                        'vrptw', n_feasible=n_feasible_list,
+                        at_depot=at_depot_list, time=time_list,
+                        vis_ratio=vis_ratio_list, n_bins=ENTROPY_N_BINS)
+                bid_d = torch.arange(batch_size, device=device).repeat_interleave(
+                    POMO_SIZE * gid_d.size(-1))
+                gid_global_d = bid_d * n_grp_d + gid_d.reshape(-1)
+                omega_sq, _ = anova_omega_squared(
+                    signal_flat, valid_flat, gid_global_d, batch_size * n_grp_d)
+                if omega_AM is not None:
+                    omega_AM.push(omega_sq.unsqueeze(0))
 
-                r2_f2 = ols_r2_per_instance(entropy_list, valid, feats_main,
-                                             include_extras=False)
-                r2_f5 = ols_r2_per_instance(entropy_list, valid, feats_main,
-                                             include_extras=True)
-                if r2f2_AM is not None:
-                    r2f2_AM.push(r2_f2.unsqueeze(0))
-                if r2f5_AM is not None:
-                    r2f5_AM.push(r2_f5.unsqueeze(0))
+                # ── H3: c_t coefficient of variation. Low CV → softmax is
+                # nearly uniform → reweight effectively does nothing.
+                vmf = valid.float()
+                n_valid = vmf.sum().clamp(min=1.0)
+                ct_mean = (weights * vmf).sum() / n_valid
+                ct_var  = (((weights - ct_mean) * vmf) ** 2).sum() / n_valid
+                ct_cv   = ct_var.sqrt() / ct_mean.clamp(min=1e-8)
+                if ctCV_AM is not None:
+                    ctCV_AM.push(ct_cv.unsqueeze(0))
+
+                # ── H4: σ²_traj / σ²_step — signal's natural granularity.
+                # > 1 → signal varies more across trajectories than within
+                # (signal is trajectory-level, step reweight is wrong unit).
+                # < 1 → step-level variation dominates (step reweight is right
+                # unit for granularity, regardless of whether it works).
+                n_per_traj  = vmf.sum(dim=2).clamp(min=1.0)                      # (B, P)
+                mean_per_t  = (entropy_list * vmf).sum(dim=2) / n_per_traj      # (B, P)
+                sig_traj    = mean_per_t.var(dim=1, unbiased=False).mean()
+                diff_t      = entropy_list - mean_per_t.unsqueeze(2)
+                sig_step_per = ((diff_t ** 2) * vmf).sum(dim=2) / n_per_traj
+                sig_step    = sig_step_per.mean()
+                sig_ratio   = sig_traj / sig_step.clamp(min=1e-8)
+                if sigRat_AM is not None:
+                    sigRat_AM.push(sig_ratio.unsqueeze(0))
+
+                # ── H1: lag-1 autocorrelation corr(H_t, H_{t-1}) within
+                # trajectory. High (>0.5) → signal has temporal structure
+                # (not pure noise). Low (<0.2) → signal is instantaneous
+                # noise dominated → supports H1 (signal has no exploitable
+                # structure). Only computed over (t, t-1) pairs both valid.
+                if entropy_list.size(2) >= 2:
+                    a = entropy_list[:, :, 1:]                                   # H_t
+                    b = entropy_list[:, :, :-1]                                  # H_{t-1}
+                    m_pair = (valid[:, :, 1:].float() * valid[:, :, :-1].float())
+                    n_pair = m_pair.sum().clamp(min=1.0)
+                    mu_a = (a * m_pair).sum() / n_pair
+                    mu_b = (b * m_pair).sum() / n_pair
+                    cov  = (((a - mu_a) * (b - mu_b)) * m_pair).sum() / n_pair
+                    var_a = (((a - mu_a) ** 2) * m_pair).sum() / n_pair
+                    var_b = (((b - mu_b) ** 2) * m_pair).sum() / n_pair
+                    lag1  = (cov / (var_a.sqrt() * var_b.sqrt()).clamp(min=1e-8)).clamp(min=-1.0, max=1.0)
+                    if lagCorr_AM is not None:
+                        lagCorr_AM.push(lag1.unsqueeze(0))
         else:
             log_prob = prob_list.log().sum(dim=2)
 
@@ -391,31 +411,26 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - timer_start))
             extra = ""
             phase = "warmup" if not apply_pert else "active"
-            if USE_MONOSEG_BASELINE and rw_AM is not None and rw_AM.count > 0:
-                # Monoseg-mode log: trajectory-internal trend signals.
-                extra = ("  Mseg({}): rw={:.3f}  nsegs={:.1f}  seglen={:.1f}"
-                         "  ΔH±=({:+.3f}/{:+.3f})  ctTop3={:.3f}"
-                         "  |A|/σ_A={:.3f}").format(
-                    phase, rw_AM.result(),
-                    nsegs_AM.result() if nsegs_AM.count > 0 else float('nan'),
-                    seglen_AM.result() if seglen_AM.count > 0 else float('nan'),
-                    dPos_AM.result() if dPos_AM.count > 0 else float('nan'),
-                    dNeg_AM.result() if dNeg_AM.count > 0 else float('nan'),
-                    ctTop3_AM.result() if ctTop3_AM.count > 0 else float('nan'),
-                    asnr_AM.result() if asnr_AM.count > 0 else float('nan'))
-                if USE_MONOSEG_POSTBUCKET and pbAbs_AM is not None and pbAbs_AM.count > 0:
-                    extra += "  PB: |Δ̄|={:.3f}  act={:.2f}".format(
-                        pbAbs_AM.result(), pbAct_AM.result())
-            elif top3_AM is not None and top3_AM.count > 0:
-                # Bucket-mode log (unchanged).
-                extra = "  Z({}):top3={:.3f} small={:.3f} rw={:.3f} R²={:.3f}".format(
-                    phase, top3_AM.result(), small_AM.result(), rw_AM.result(),
-                    r2_AM.result() if r2_AM.count > 0 else float('nan'))
-            # OLS R² diagnostic (appended to whichever mode log line was built)
-            if r2f2_AM is not None and r2f2_AM.count > 0:
-                extra += "  OLS: F2={:.3f}  F5={:.3f}".format(
-                    r2f2_AM.result(),
-                    r2f5_AM.result() if r2f5_AM.count > 0 else float('nan'))
+            mode  = "Mseg" if USE_MONOSEG_BASELINE else "Z"
+            if rw_AM is not None and rw_AM.count > 0:
+                extra = "  {}({}): top3={:.3f} rw={:.3f} ctTop3={:.3f}".format(
+                    mode, phase,
+                    top3_AM.result() if (top3_AM is not None and top3_AM.count > 0) else float('nan'),
+                    rw_AM.result(),
+                    ctTop3_AM.result() if (ctTop3_AM is not None and ctTop3_AM.count > 0) else float('nan'))
+                if USE_MONOSEG_BASELINE and nsegs_AM is not None and nsegs_AM.count > 0:
+                    extra += "  nsegs={:.1f} seglen={:.1f}".format(
+                        nsegs_AM.result(), seglen_AM.result())
+                # H1-H4 diagnostics
+                extra += ("  | H1:MLPR²={:.3f} lag1={:+.3f}"
+                          "  H2:ω²={:.3f}"
+                          "  H3:ctCV={:.3f}"
+                          "  H4:σ²ratio={:.3f}").format(
+                    mlpR2_AM.result()  if (mlpR2_AM  is not None and mlpR2_AM.count  > 0) else float('nan'),
+                    lagCorr_AM.result()if (lagCorr_AM is not None and lagCorr_AM.count> 0) else float('nan'),
+                    omega_AM.result()  if (omega_AM  is not None and omega_AM.count  > 0) else float('nan'),
+                    ctCV_AM.result()   if (ctCV_AM   is not None and ctCV_AM.count   > 0) else float('nan'),
+                    sigRat_AM.result() if (sigRat_AM is not None and sigRat_AM.count > 0) else float('nan'))
                 if corrH_AM is not None and corrH_AM.count > 0:
                     cH = corrH_AM.result()
                     cL = corrL_AM.result() if corrL_AM.count > 0 else float('nan')
