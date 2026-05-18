@@ -154,8 +154,43 @@ else:
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logger, result_folder_path = Get_Logger(SAVE_FOLDER_NAME)
-shutil.copy('./HYPER_PARAMS.py',
-            os.path.join(result_folder_path, 'used_HYPER_PARAMS.txt'))
+
+
+def _dump_effective_hyperparams(folder_path, args, save_folder_name):
+    """
+    Serialize the *effective* hyperparameters (HYPER_PARAMS defaults overridden
+    by CLI args at runtime) plus the raw CLI invocation. The previous
+    shutil.copy('./HYPER_PARAMS.py', ...) only copied the on-disk defaults
+    and gave the same content for every run regardless of CLI overrides —
+    completely breaking per-run reproducibility.
+    """
+    import HYPER_PARAMS as _hp_module
+    lines = []
+    lines.append("# Effective hyperparameters at runtime")
+    lines.append("# run name: " + save_folder_name)
+    lines.append("# generated: " + time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("")
+    lines.append("# ── CLI args (None = not set, uses HYPER_PARAMS default) ──")
+    for k in sorted(vars(args).keys()):
+        v = getattr(args, k)
+        lines.append("#   --{}: {!r}".format(k.replace('_', '-'), v))
+    lines.append("")
+    lines.append("# ── All HYPER_PARAMS values in effect ──")
+    for name in sorted(vars(_hp_module).keys()):
+        if name.startswith('_'):
+            continue
+        if not name.isupper():
+            continue
+        val = getattr(_hp_module, name)
+        if callable(val):
+            continue
+        lines.append("{} = {!r}".format(name, val))
+    with open(os.path.join(folder_path, 'used_HYPER_PARAMS.txt'),
+              'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+
+
+_dump_effective_hyperparams(result_folder_path, _args, SAVE_FOLDER_NAME)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
