@@ -697,7 +697,10 @@ def compute_trajinternal_weights(entropy, valid_mask, advantage,
     """
     entropy:           (B, P, T) — model entropy per step
     valid_mask:        (B, P, T) bool — True = real decision step
-    advantage:         (B, P) — trajectory-level POMO advantage
+    advantage:         (B, P) — accepted for call-site compatibility; NOT used
+                        in c_t. A's sign continues to flip reward/punish in the
+                        outer loss `-(A · Σ_t c_t · log π_t)`; we don't fold
+                        it into the within-trajectory weight redistribution.
     gamma:             float — softmax logit scale
     n_feasible:        (B, P, T) — kept for diagnostic only; NOT used for masking.
                         Forced steps participate in the softmax but contribute 0
@@ -705,13 +708,18 @@ def compute_trajinternal_weights(entropy, valid_mask, advantage,
                         harmless to include.
     apply_perturbation: bool — warmup → c_t = 1 on valid (matches baseline POMO)
 
-    Logic — preserves Σ_t c_t = T_valid (e.g. 100 if T_valid=100):
+    Logic — only attends to high entropy. No sign(A) dependence in c_t;
+    the direction of credit (reward / punish) is handled by A in the outer
+    loss as usual. c_t purely redistributes trajectory-level credit toward
+    the high-entropy steps within the same trajectory.
+
+    Σ_t c_t = T_valid (e.g. 100 if T_valid = 100):
         μ_traj = mean_t(H_t · valid)                          per (B, P)
         ΔH_t   = H_t − μ_traj
-        Active : c_t = softmax(γ·sign(A)·ΔH_t over valid) · T_valid    on valid
-                       0                                                 on invalid
-        Warmup : c_t = 1                                                 on valid
-                       0                                                 on invalid
+        Active : c_t = softmax(γ · ΔH_t over valid) · T_valid    on valid
+                       0                                          on invalid
+        Warmup : c_t = 1                                          on valid
+                       0                                          on invalid
 
     Returns:
         w:    (B, P, T)   — Σ_t w = T_valid per trajectory.
@@ -729,9 +737,10 @@ def compute_trajinternal_weights(entropy, valid_mask, advantage,
 
     if apply_perturbation:
         # Softmax over ALL valid steps (forced included, harmless).
-        sign_A = advantage.sign().unsqueeze(2)                          # (B, P, 1)
-        logit  = (gamma * sign_A * delta_H).masked_fill(~valid_mask, -1e9)
-        w      = torch.softmax(logit, dim=2) * T_valid * vmf            # invalid → 0
+        # No sign(A): always amplify high-ΔH steps regardless of advantage
+        # sign. A's sign flips reward/punish through the outer loss.
+        logit = (gamma * delta_H).masked_fill(~valid_mask, -1e9)
+        w     = torch.softmax(logit, dim=2) * T_valid * vmf             # invalid → 0
     else:
         # Warmup: baseline POMO. Σ_t c_t = T_valid (each valid gets c_t = 1).
         w = vmf
