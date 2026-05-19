@@ -120,6 +120,18 @@ USE_MONOSEG_BASELINE     = False
 # typical "anchor→t" trend at that state class.
 USE_MONOSEG_POSTBUCKET   = False
 
+# ── Trajectory-internal baseline (no bucket, no environment estimation) ─────
+# When True, ΔH_t = H_t − μ_traj (per-trajectory mean over valid steps).
+# Softmax over each trajectory's rw subset redistributes c_t with
+# sign(A)·ΔH_t as the logit. Completely sidesteps environment estimation —
+# each trajectory rolls out under one (instance × policy snapshot) so the
+# trajectory itself controls for both. Designed for CVRP/VRPTW where bucket-Z
+# fails to cleanly separate environment from confidence (coordinates / partial
+# route geometry are not in any discrete state feature). Mutually exclusive
+# with USE_MONOSEG_BASELINE; takes precedence over bucket-related flags
+# (USE_VIS_RATIO_BIN, LOW_GRP_MEAN_THRESH, USE_BIDIR_NORM, USE_ROBUST_NORM).
+USE_TRAJINTERNAL_BASELINE = False
+
 # Robust normalization: replace mean+std with median+IQR/1.349 per bucket.
 # Small buckets with under-estimated grp_std produce |ΔH| >> 1 outliers under
 # z-score because std is corrupted by 1-2 extreme values. Quantile-based

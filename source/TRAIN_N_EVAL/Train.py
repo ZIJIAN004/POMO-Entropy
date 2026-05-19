@@ -40,6 +40,7 @@ from HYPER_PARAMS import *
 from source.utilities import Average_Meter
 from source.baseline import (build_group_id, compute_entropy_z_weights,
                               compute_monoseg_weights,
+                              compute_trajinternal_weights,
                               anova_omega_squared, MLPSignalEstimator)
 
 
@@ -182,7 +183,24 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             T_total = prob_list.size(2)
             valid   = _make_valid_mask(T_total, batch_size, device, finished_list)
 
-            if USE_MONOSEG_BASELINE:
+            if USE_TRAJINTERNAL_BASELINE:
+                # Pure trajectory-internal: ΔH = H − μ_traj, softmax over all
+                # valid steps, Σ_t c_t = T_valid. No bucket, no env estimation.
+                weights, diag = compute_trajinternal_weights(
+                    entropy=entropy_list,
+                    valid_mask=valid,
+                    advantage=advantage,
+                    gamma=ENTROPY_GAMMA,
+                    n_feasible=n_feasible_list,
+                    apply_perturbation=apply_pert,
+                )
+                log_prob = (prob_list.log() * weights).sum(dim=2)
+
+                if rw_AM is not None:
+                    rw_AM.push(diag['rw_ratio'].unsqueeze(0))
+                if ctTop3_AM is not None:
+                    ctTop3_AM.push(diag['ct_top3'].unsqueeze(0))
+            elif USE_MONOSEG_BASELINE:
                 # Trajectory-internal monotonic-segment baseline.
                 # Optional post-bucket norm: 3-dim bucket (no vis_ratio).
                 gid_arg, n_grp_arg = None, None
@@ -411,7 +429,12 @@ def TRAIN(model, env, optimizer, lr_scheduler, epoch, timer_start, logger):
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - timer_start))
             extra = ""
             phase = "warmup" if not apply_pert else "active"
-            mode  = "Mseg" if USE_MONOSEG_BASELINE else "Z"
+            if USE_TRAJINTERNAL_BASELINE:
+                mode = "Tin"
+            elif USE_MONOSEG_BASELINE:
+                mode = "Mseg"
+            else:
+                mode = "Z"
             if rw_AM is not None and rw_AM.count > 0:
                 extra = "  {}({}): top3={:.3f} rw={:.3f} ctTop3={:.3f}".format(
                     mode, phase,

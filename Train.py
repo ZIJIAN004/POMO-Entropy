@@ -39,6 +39,10 @@ _parser.add_argument('--lowg-thresh', type=float, default=None,
 _parser.add_argument('--monoseg', type=str, default=None, choices=['on', 'off'],
                      help='use monotonic-segment baseline instead of bucket: '
                           'ΔH_t = H_t − H[last_reversal_t], softmax over trajectory.')
+_parser.add_argument('--trajinternal', type=str, default=None, choices=['on', 'off'],
+                     help='use trajectory-internal baseline (no bucket): '
+                          'ΔH_t = H_t − μ_traj, softmax over trajectory. '
+                          'Mutually exclusive with --monoseg.')
 _parser.add_argument('--postbucket', type=str, default=None, choices=['on', 'off'],
                      help='only with --monoseg on: subtract bucket-mean of '
                           'ΔH_local within (n_feasible, at_depot, load_bin).')
@@ -80,6 +84,8 @@ if _args.monoseg is not None:
     _HP.USE_MONOSEG_BASELINE = (_args.monoseg == 'on')
 if _args.postbucket is not None:
     _HP.USE_MONOSEG_POSTBUCKET = (_args.postbucket == 'on')
+if _args.trajinternal is not None:
+    _HP.USE_TRAJINTERNAL_BASELINE = (_args.trajinternal == 'on')
 if _args.robust is not None:
     _HP.USE_ROBUST_NORM = (_args.robust == 'on')
 if _args.signal is not None:
@@ -90,7 +96,9 @@ from HYPER_PARAMS import *
 _tag = ""
 if USE_ENTROPY_REWEIGHT:
     _tag += "-Z_g{}_w{}".format(ENTROPY_GAMMA, ENTROPY_WARMUP_EPOCHS)
-    if USE_MONOSEG_BASELINE:
+    if USE_TRAJINTERNAL_BASELINE:
+        _tag += "-Tin"
+    elif USE_MONOSEG_BASELINE:
         _tag += "-Mseg"
         if USE_MONOSEG_POSTBUCKET:
             _tag += "-PB"

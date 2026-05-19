@@ -674,3 +674,101 @@ def compute_monoseg_weights(entropy, valid_mask, advantage,
         'pb_active_frac':  pb_active_frac.detach(),
     }
     return w, diag
+
+
+# ---------------------------------------------------------------------------
+# Trajectory-internal reweighting (no bucket, no environment estimation).
+#
+# Rationale on CVRP: bucket-Z fails to cleanly subtract environment because
+# our 4-dim discrete bucket can't capture continuous geometric features
+# (node coordinates, partial route geometry). Trajectory-internal sidesteps
+# this entirely — each trajectory rolls out under one (instance, policy
+# snapshot), so the trajectory itself controls for both. ΔH_t = H_t − μ_traj
+# is the deviation from this rollout's own average uncertainty.
+#
+# Tradeoff: signal is per-trajectory relative only, loses cross-instance
+# absolute level. But that's exactly what we want — no environment to leak.
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_trajinternal_weights(entropy, valid_mask, advantage,
+                                  gamma, n_feasible=None,
+                                  apply_perturbation=True):
+    """
+    entropy:           (B, P, T) — model entropy per step
+    valid_mask:        (B, P, T) bool — True = real decision step
+    advantage:         (B, P) — trajectory-level POMO advantage
+    gamma:             float — softmax logit scale
+    n_feasible:        (B, P, T) — kept for diagnostic only; NOT used for masking.
+                        Forced steps participate in the softmax but contribute 0
+                        to the loss (log π = 0 at forced step), so they're
+                        harmless to include.
+    apply_perturbation: bool — warmup → c_t = 1 on valid (matches baseline POMO)
+
+    Logic — preserves Σ_t c_t = T_valid (e.g. 100 if T_valid=100):
+        μ_traj = mean_t(H_t · valid)                          per (B, P)
+        ΔH_t   = H_t − μ_traj
+        Active : c_t = softmax(γ·sign(A)·ΔH_t over valid) · T_valid    on valid
+                       0                                                 on invalid
+        Warmup : c_t = 1                                                 on valid
+                       0                                                 on invalid
+
+    Returns:
+        w:    (B, P, T)   — Σ_t w = T_valid per trajectory.
+        diag: dict { rw_ratio, ct_top3, traj_std_mean, dH_pos_mean,
+                     dH_neg_mean, delta_H, rw_mask }
+    """
+    B, P, T = entropy.shape
+    device  = entropy.device
+    vmf     = valid_mask.float()
+    T_valid = vmf.sum(dim=2, keepdim=True).clamp(min=1.0)              # (B, P, 1)
+
+    # ── Per-trajectory mean over valid steps. ───────────────────────────
+    mu_t    = (entropy * vmf).sum(dim=2, keepdim=True) / T_valid       # (B, P, 1)
+    delta_H = entropy - mu_t                                            # (B, P, T)
+
+    if apply_perturbation:
+        # Softmax over ALL valid steps (forced included, harmless).
+        sign_A = advantage.sign().unsqueeze(2)                          # (B, P, 1)
+        logit  = (gamma * sign_A * delta_H).masked_fill(~valid_mask, -1e9)
+        w      = torch.softmax(logit, dim=2) * T_valid * vmf            # invalid → 0
+    else:
+        # Warmup: baseline POMO. Σ_t c_t = T_valid (each valid gets c_t = 1).
+        w = vmf
+
+    # ── Diagnostics ─────────────────────────────────────────────────────
+    # rw_ratio: kept for log-format compatibility with bucket/monoseg paths.
+    # Here it reports the fraction of valid steps that are "decision-bearing"
+    # (n_feasible > 1) — forced steps are valid but contribute zero gradient.
+    if n_feasible is not None:
+        rw_mask = valid_mask & (n_feasible > 1)
+    else:
+        rw_mask = valid_mask.clone()
+    rw_per_inst    = rw_mask.float().sum(dim=(1, 2))
+    valid_per_inst = vmf.sum(dim=(1, 2)).clamp(min=1.0)
+    rw_ratio       = (rw_per_inst / valid_per_inst).mean()
+
+    # c_t top-3 concentration per trajectory (over all valid).
+    ct_top3_per_traj = (w * vmf).topk(min(3, T), dim=2).values.sum(dim=2)
+    ct_top3 = (ct_top3_per_traj / T_valid.squeeze(2).clamp(min=1.0)).mean()
+
+    # Per-trajectory entropy std — signal magnitude available within each traj.
+    var_t = ((entropy - mu_t).square() * vmf).sum(dim=2) / T_valid.squeeze(2)
+    traj_std_mean = var_t.sqrt().mean()
+
+    # ΔH split by sign on valid steps.
+    pos_mask = valid_mask & (delta_H > 0)
+    neg_mask = valid_mask & (delta_H < 0)
+    dH_pos_mean = (delta_H * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)
+    dH_neg_mean = (delta_H * neg_mask.float()).sum() / neg_mask.float().sum().clamp(min=1.0)
+
+    diag = {
+        'rw_ratio':       rw_ratio.detach(),
+        'ct_top3':        ct_top3.detach(),
+        'traj_std_mean':  traj_std_mean.detach(),
+        'dH_pos_mean':    dH_pos_mean.detach(),
+        'dH_neg_mean':    dH_neg_mean.detach(),
+        'delta_H':        delta_H.detach(),
+        'rw_mask':        rw_mask.detach(),
+    }
+    return w, diag
